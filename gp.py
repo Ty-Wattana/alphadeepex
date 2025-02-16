@@ -16,6 +16,7 @@ from alphagen_qlib.stock_data import initialize_qlib
 from gplearn.fitness import make_fitness
 from gplearn.functions import make_function
 from gplearn.genetic import SymbolicRegressor
+from alphagen.data.parser import parse_expression
 
 if __name__ == "__main__":
     freeze_support()
@@ -93,10 +94,15 @@ if __name__ == "__main__":
 
         most_common = dict(Counter(cache).most_common(capacity if mutual_ic_thres is None else None))
         for key in most_common:
-            if acceptable(key):
-                exprs.append(eval(key))
-                if len(exprs) >= capacity:
-                    break
+            try:
+                parse_expression(key)
+                if acceptable(key):
+                    exprs.append(eval(key))
+                    if len(exprs) >= capacity:
+                        break
+            except:
+                continue
+            
         pool.force_load_exprs(exprs)
 
         ic_train, ric_train = pool.test_ensemble(calculator_train)
