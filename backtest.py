@@ -167,7 +167,7 @@ if __name__ == "__main__":
             report = json.load(f)
         state = report["res"]["res"]["pool_state"]
         run_backtest("gp", seed, [parse_expression(e) for e in state["exprs"]], state["weights"])
-    exit(0)
+    # exit(0)
     for p in Path("out/results").iterdir():
         inst, size, seed, time, ver = p.name.split('_', 4)
         size, seed = int(size), int(seed)
@@ -175,6 +175,7 @@ if __name__ == "__main__":
             continue
         exprs, weights = load_alpha_pool_by_path(str(p / "251904_steps_pool.json"))
         run_backtest(ver, seed, exprs, weights)
+    exit(0)
     for p in Path("out/llm-tests/interaction").iterdir():
         if not p.name.startswith("v1"):
             continue
