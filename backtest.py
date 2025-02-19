@@ -152,8 +152,8 @@ if __name__ == "__main__":
     qlib_backtest = QlibBacktest(top_k=50, n_drop=5)
     data = StockData(
         instrument="csi300",
-        start_time="2022-01-01",
-        end_time="2023-06-30"
+        start_time="2020-01-01",
+        end_time="2022-01-01"
     )
     calc = QLibStockDataCalculator(data, None)
 

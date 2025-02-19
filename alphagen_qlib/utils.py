@@ -12,7 +12,7 @@ def load_recent_data(instrument: str,
                      window_size: int = 365,
                      offset: int = 1,
                      **kwargs) -> Tuple[StockData, str]:
-    today = datetime.date.today()
+    today = datetime.datetime.strptime("2024-12-31", '%Y-%m-%d').date() #datetime.date.today()
     start_date = str(today - datetime.timedelta(days=window_size))
     end_date = str(today - datetime.timedelta(days=offset))
 

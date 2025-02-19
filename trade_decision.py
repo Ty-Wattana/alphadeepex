@@ -8,7 +8,7 @@ from alphagen_qlib.strategy import TopKSwapNStrategy
 from alphagen_qlib.utils import load_alpha_pool_by_path, load_recent_data
 
 
-POOL_PATH = '/DATA/xuehy/logs/kdd_csi300_20_4_20230410071036/301056_steps_pool.json'
+POOL_PATH = 'out/results/csi300_20_0_20250208124320_rl/251904_steps_pool.json'
 
 
 if __name__ == '__main__':
