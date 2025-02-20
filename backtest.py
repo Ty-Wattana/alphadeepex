@@ -175,6 +175,17 @@ if __name__ == "__main__":
             continue
         exprs, weights = load_alpha_pool_by_path(str(p / "251904_steps_pool.json"))
         run_backtest(ver, seed, exprs, weights)
+
+    for p in Path("out/boot_dqn").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "250624_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
     exit(0)
     for p in Path("out/llm-tests/interaction").iterdir():
         if not p.name.startswith("v1"):
