@@ -4,7 +4,6 @@ from typing import Optional, Tuple, List
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
-import fire
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
@@ -19,15 +18,12 @@ from alphagen_qlib.stock_data import initialize_qlib
 from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.system_prompt import EXPLAIN_WITH_TEXT_DESC
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
-from alphagen.rl.policy import LSTMSharedNet
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import torch
 import numpy as np
-from stable_baselines3 import DQN
 from typing import List, Optional
-from sb3_contrib.common.maskable.utils import get_action_masks
 from typing import TypeVar
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 
@@ -116,7 +112,9 @@ class CustomCallback(BaseCallback):
             self.logger.record(f'test/rank_ic_{i}', rank_ic_test)
         self.logger.record(f'test/ic_mean', ic_test_mean)
         self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
-        self.save_checkpoint()
+        
+        if self.num_timesteps % 2048 == 0:
+            self.save_checkpoint()
 
     def save_checkpoint(self):
         path = os.path.join(self.save_path, f'{self.num_timesteps}_steps')
@@ -266,27 +264,28 @@ def run_single_experiment(
     model = BootstrappedDQN(
         policy="MlpPolicy",
         env=env,
-        train_freq=(50, "episode"),
+        train_freq=(1, "episode"),
         num_bootstrapped_nets=10,
         mask_prob=0.8,
         learning_rate=1e-4,
         buffer_size=100000,
-        batch_size=64,
+        batch_size=128,
         gamma=0.99,
         target_update_interval=1000,
         exploration_fraction=0.1,
         exploration_final_eps=0.01,
         verbose=1,
+        learning_starts=1000,
         tensorboard_log="./out/boot_tensorboard",
-        policy_kwargs=dict(
-            features_extractor_class=LSTMSharedNet,
-            features_extractor_kwargs=dict(
-                n_layers=2,
-                d_model=128,
-                dropout=0.1,
-                device=device,
-            ),
-        ),
+        # policy_kwargs=dict(
+        #     features_extractor_class=LSTMSharedNet,
+        #     features_extractor_kwargs=dict(
+        #         n_layers=2,
+        #         d_model=128,
+        #         dropout=0.1,
+        #         device=device,
+        #     ),
+        # ),
     )
     model.learn(
         total_timesteps=steps,
