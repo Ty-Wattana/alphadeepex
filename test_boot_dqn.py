@@ -18,6 +18,7 @@ from alphagen_qlib.stock_data import initialize_qlib
 from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.system_prompt import EXPLAIN_WITH_TEXT_DESC
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
+from alphagen.rl.policy import LSTMSharedNet
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
@@ -251,7 +252,8 @@ def run_single_experiment(
     env = AlphaEnvDense(
         pool=pool,
         device=device,
-        print_expr=True
+        print_expr=True,
+        constrain = True,
     )
     checkpoint_callback = CustomCallback(
         save_path=save_path,
@@ -277,15 +279,15 @@ def run_single_experiment(
         verbose=1,
         learning_starts=1000,
         tensorboard_log="./out/boot_tensorboard",
-        # policy_kwargs=dict(
-        #     features_extractor_class=LSTMSharedNet,
-        #     features_extractor_kwargs=dict(
-        #         n_layers=2,
-        #         d_model=128,
-        #         dropout=0.1,
-        #         device=device,
-        #     ),
-        # ),
+        policy_kwargs=dict(
+            features_extractor_class=LSTMSharedNet,
+            features_extractor_kwargs=dict(
+                n_layers=2,
+                d_model=128,
+                dropout=0.1,
+                device=device,
+            ),
+        ),
     )
     model.learn(
         total_timesteps=steps,
