@@ -1,27 +1,18 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import copy
-from typing import Optional, Tuple, List
 from stable_baselines3 import DQN
-from typing import Optional
-# from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.common.noise import ActionNoise
-from sb3_contrib.common.maskable.utils import get_action_masks
 from gymnasium import spaces
-import torch.nn.functional as F
-import random
+from sb3_contrib.common.maskable.utils import get_action_masks
 
 # Polyak update helper function
 def polyak_update(source_params, target_params, tau):
     for src, tgt in zip(source_params, target_params):
         tgt.data.copy_(tau * src.data + (1 - tau) * tgt.data)
 
-def adjust_action_mask(mask: torch.Tensor, target_shape: Tuple[int, int]) -> torch.Tensor:
-    """
-    Adjusts the action mask to have the same shape as target_shape (batch_size, num_actions).
-    If the mask has fewer columns, it pads with zeros; if it has more, it truncates.
-    """
+def adjust_action_mask(mask: torch.Tensor, target_shape: tuple) -> torch.Tensor:
     batch_size, n_actions_target = target_shape
     batch_size_mask, n_actions_mask = mask.shape
     if n_actions_mask < n_actions_target:
@@ -34,39 +25,62 @@ def adjust_action_mask(mask: torch.Tensor, target_shape: Tuple[int, int]) -> tor
     return adjusted_mask
 
 class LSTMQNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_actions):
+    def __init__(self, input_dim, hidden_dim, num_actions, vocab_size=None, embedding_dim=None):
+        """
+        If vocab_size and embedding_dim are provided, the network will use an embedding layer
+        to convert discrete token indices into dense vectors before processing.
+        """
         super(LSTMQNet, self).__init__()
-        self.fc = nn.Linear(input_dim, hidden_dim)
-        # LSTM expects input shape (batch, seq_len, features)
+        self.hidden_dim = hidden_dim
+        # If tokenized inputs are used, add an embedding layer.
+        if vocab_size is not None and embedding_dim is not None:
+            self.embedding = nn.Embedding(vocab_size, embedding_dim)
+            fc_input_dim = embedding_dim
+        else:
+            self.embedding = None
+            fc_input_dim = input_dim
+        self.fc = nn.Linear(fc_input_dim, hidden_dim)
         self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
         self.out = nn.Linear(hidden_dim, num_actions)
-        self.hidden_dim = hidden_dim
 
     def extract_features(self, obs):
-        # Check the dimensionality of obs.
-        # If obs is 4D (batch, channels, height, width), flatten the last three dims.
-        if obs.dim() == 4:
-            # Convert from (batch, channels, height, width) to (batch, channels*height*width)
-            obs = obs.view(obs.size(0), -1)
-            # Then add a sequence dimension so that shape becomes (batch, 1, feature_dim)
-            obs = obs.unsqueeze(1)
-        # If obs is 5D (batch, seq_len, channels, height, width), flatten the spatial dims.
-        elif obs.dim() == 5:
-            batch, seq_len, c, h, w = obs.size()
-            obs = obs.view(batch, seq_len, c * h * w)
-        # If obs is already 2D or 3D, assume it's in the correct shape.
+        """
+        If an embedding layer is defined and the observation is integer (token indices),
+        embed the tokens. Otherwise, process as before.
+        """
+        # If obs is a token sequence (e.g. LongTensor) and embedding layer is defined.
+        if self.embedding is not None and obs.dtype in [torch.long, torch.int]:
+            # Expect obs shape to be (batch, seq_len)
+            obs = self.embedding(obs)
+        else:
+            # If obs is 4D (batch, channels, height, width), flatten spatial dims
+            if obs.dim() == 4:
+                obs = obs.view(obs.size(0), -1)
+                obs = obs.unsqueeze(1)
+            # If obs is 5D (batch, seq_len, channels, height, width), flatten spatial dims
+            elif obs.dim() == 5:
+                batch, seq_len, c, h, w = obs.size()
+                obs = obs.view(batch, seq_len, c * h * w)
+            # Otherwise assume obs is already in (batch, seq_len, features) or (batch, features)
+            # If obs is 2D (batch, features), add a sequence dimension.
+            elif obs.dim() == 2:
+                obs = obs.unsqueeze(1)
         return obs
 
     def forward(self, obs, hidden=None):
-        # First, extract (and flatten) features.
-        features = self.extract_features(obs)  # now shape should be (batch, seq_len, feature_dim)
+        # Extract features (using embedding if defined)
+        features = self.extract_features(obs)
+        features = features.float()
         features = F.relu(self.fc(features))
+        # Flatten LSTM parameters to ensure they are contiguous in memory.
+        self.lstm.flatten_parameters()
+        # If no hidden state is passed, initialize with zeros.
         if hidden is None:
             batch = features.size(0)
             h0 = torch.zeros(1, batch, self.hidden_dim, device=features.device)
             c0 = torch.zeros(1, batch, self.hidden_dim, device=features.device)
             hidden = (h0, c0)
-        # Process through LSTM (expects 3D input).
+        # Process through LSTM.
         x, hidden = self.lstm(features, hidden)
         # Use the output of the last time step.
         x = x[:, -1, :]
@@ -80,29 +94,33 @@ class BootstrappedDQN(DQN):
         env,
         num_bootstrapped_nets: int = 10,
         mask_prob: float = 0.8,
-        device = "cuda",
+        device="cuda",
+        # Optionally pass embedding parameters if using token sequences.
+        vocab_size: int = None,
+        embedding_dim: int = None,
         **kwargs,
     ):
         super().__init__(policy, env, **kwargs)
         self.num_bootstrapped_nets = num_bootstrapped_nets
         self.mask_prob = mask_prob
+        self.device = device
 
         # Get environment dimensions.
+        # If using token sequences, input_dim should be set to the sequence length (or token feature dim)
         obs_dim = env.observation_space.shape[0]
         num_actions = env.action_space.n
         hidden_dim = 64  # arbitrary hidden dimension
 
         # Create independent copies of the Q-network and its target network for each head.
         self.q_networks = nn.ModuleList([
-            copy.deepcopy(LSTMQNet(obs_dim, hidden_dim, num_actions).to(device)) for _ in range(num_bootstrapped_nets)
+            copy.deepcopy(LSTMQNet(obs_dim, hidden_dim, num_actions, vocab_size, embedding_dim).to(device))
+            for _ in range(num_bootstrapped_nets)
         ])
         self.target_q_networks = nn.ModuleList([
             copy.deepcopy(net) for net in self.q_networks
         ])
-
         # For simplicity we use a single optimizer over all network parameters.
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        
         # For deep exploration: current_head indicates which head to follow this episode.
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
@@ -111,234 +129,98 @@ class BootstrappedDQN(DQN):
         for net in self.q_networks:
             params += list(net.parameters())
         return params
-        
+
     def sample_episode_head(self):
         """Call this at the beginning of each episode to choose a head for deep exploration."""
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
-    
+
     def _sample_bootstrapped_masks(self, batch_size: int) -> torch.Tensor:
-        """
-        Generate bootstrapped masks for each Q-network.
-        Each mask is a binary tensor of shape (batch_size,).
-        """
         masks = torch.rand((self.num_bootstrapped_nets, batch_size)) < self.mask_prob
         return masks.float().to(self.device)
-    
+
     def store_transition(self, transition):
-        # Each transition is a tuple: (obs, action, reward, next_obs, done)
         self.replay_buffer.append(transition)
 
-    # def train(self, gradient_steps: int, batch_size: int = 100) -> None:
-    #     """
-    #     Train each Q-network using bootstrapped masks.
-    #     Here we also sample a new head at the start of training (simulating an episode).
-    #     In your full training loop, you should call sample_episode_head() whenever you reset your environment.
-    #     """
-    #     self.sample_episode_head()
-    #     self.policy.set_training_mode(True)
-    #     self._update_learning_rate(self.policy.optimizer)
-
-    #     for _ in range(gradient_steps):
-    #         replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-    #         masks = self._sample_bootstrapped_masks(batch_size).to(self.device)
-
-    #         for i in range(self.num_bootstrapped_nets):
-    #             with torch.no_grad():
-    #                 next_q_values = self.target_q_networks[i](replay_data.next_observations)
-    #                 next_q_values, _ = torch.max(next_q_values, dim=1)
-    #                 rewards = replay_data.rewards.squeeze(-1)   # now shape: (batch_size,)
-    #                 dones   = replay_data.dones.squeeze(-1)     # now shape: (batch_size,)
-    #                 target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
-
-    #             current_q_values = self.q_networks[i](replay_data.observations)
-
-    #             # Ensure the output is 2D: (batch_size, num_actions)
-    #             if current_q_values.dim() > 2:
-    #                 current_q_values = current_q_values.view(current_q_values.size(0), -1)
-                
-    #             if replay_data.actions.dim() == 1:
-    #                 action_indices = replay_data.actions.long().unsqueeze(1)
-    #             else:
-    #                 action_indices = replay_data.actions.long()
-                
-    #             if action_indices.dim() == 1:
-    #                 action_indices = action_indices.unsqueeze(1)
-    #             # Gather the Q-value for the taken actions.
-
-    #             # selected_q_values = current_q_values.gather(1, replay_data.actions.long().unsqueeze(1)).squeeze(1)
-    #             selected_q_values = current_q_values.gather(1, action_indices).squeeze(1)
-                
-    #             # Compute elementwise loss
-    #             loss = F.mse_loss(selected_q_values, target_q_values, reduction='none')
-    #             masked_loss = loss * masks[i]
-    #             effective_batch_size = masks[i].sum() + 1e-6
-    #             final_loss = masked_loss.sum() / effective_batch_size
-
-    #             self.policy.optimizer.zero_grad()
-    #             final_loss.backward()
-    #             self.policy.optimizer.step()
-
-    #     self._update_target_network()
-
     def train(self, gradient_steps=1, batch_size: int = 100):
-
-
         self.sample_episode_head()
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
-
-        # Use the replay buffer's sample method.
         batch = self.replay_buffer.sample(batch_size)
-        
-        # Access fields via attribute notation since 'batch' is a ReplayBufferSamples namedtuple.
-        obs = batch.observations.float().to(self.device)
+
+        obs = batch.observations.to(self.device)
         actions = batch.actions.long().to(self.device)
         rewards = batch.rewards.float().to(self.device)
-        next_obs = batch.next_observations.float().to(self.device)
+        next_obs = batch.next_observations.to(self.device)
         dones = batch.dones.float().to(self.device)
 
         reward_mean = torch.mean(rewards)
         self.logger.record("train/mean_reward", reward_mean.item())
 
-        # For the LSTM, we treat each observation as a sequence of length 1.
-        # Shape becomes: (batch, seq_len, obs_dim)
-        obs = obs.unsqueeze(1)
-        next_obs = next_obs.unsqueeze(1)
-        hidden = None  # We'll use zeroed hidden states for simplicity.
+        # Here, we assume each observation is already a token sequence.
+        # (If using continuous observations, adjust accordingly.)
+        hidden = None  # For training, you might consider preserving hidden state across tokens.
 
-        # Generate a bootstrap mask for each head.
         masks = self._sample_bootstrapped_masks(batch_size)
-
-        # Train each head separately.
         losses = []
         for i in range(self.num_bootstrapped_nets):
             with torch.no_grad():
                 next_q, _ = self.target_q_networks[i](next_obs, hidden)
                 next_max_q, _ = torch.max(next_q, dim=1)
-                target_q = rewards + self.gamma * (1 - dones) * next_max_q
+                rewards_squeezed = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
+                dones_squeezed = dones.squeeze(-1) if dones.dim() > 1 else dones
+                target_q = rewards_squeezed + self.gamma * (1 - dones_squeezed) * next_max_q
+                # target_q = rewards + self.gamma * (1 - dones) * next_max_q
 
             current_q, _ = self.q_networks[i](obs, hidden)
-
-            # Ensure the output is 2D: (batch_size, num_actions)
             if current_q.dim() > 2:
                 current_q = current_q.view(current_q.size(0), -1)
-            
-            if actions.dim() == 1:
-                action_indices = actions.long().unsqueeze(1)
-            else:
-                action_indices = actions.long()
-            
-            if action_indices.dim() == 1:
-                action_indices = action_indices.unsqueeze(1)
-            
-            # Gather the Q-value for the taken actions.
+            action_indices = actions.unsqueeze(1) if actions.dim() == 1 else actions
             current_q = current_q.gather(1, action_indices).squeeze(1)
-            # current_q = current_q.gather(1, actions.unsqueeze(1)).squeeze(1)
-
             loss = F.mse_loss(current_q, target_q, reduction='none')
-            # Multiply loss by the bootstrap mask's mean (optional)
             loss = loss * masks[i].mean()
-            
             losses.append(torch.mean(loss).item())
-
             loss = loss.mean()
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
         self.logger.record("train/loss", np.mean(losses))
-
-        # Update target networks using Polyak averaging.
         for i in range(self.num_bootstrapped_nets):
             polyak_update(self.q_networks[i].parameters(),
-                        self.target_q_networks[i].parameters(),
-                        self.tau)
-
-
-    def _update_target_network(self) -> None:
-        """
-        Update the target networks using Polyak averaging.
-        """
-        for i in range(self.num_bootstrapped_nets):
-            polyak_update(
-                self.q_networks[i].parameters(),
-                self.target_q_networks[i].parameters(),
-                self.tau,
-            )
-
-    # def predict(self, 
-    #             observation: np.ndarray, 
-    #             state: Optional[np.ndarray] = None, 
-    #             use_ensemble: bool = False,
-    #             **kwargs) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    #     """
-    #     Predict actions using the Q-networks.
-    #     If use_ensemble is False, the method uses the current episode’s head (for deep exploration).
-    #     If use_ensemble is True, it averages the predictions of all heads.
-    #     """
-    #     observation = np.array(observation)
-    #     with torch.no_grad():
-    #         observation_tensor = torch.as_tensor(observation).to(self.device)
-    #         if hasattr(self.policy, 'is_recurrent') and self.policy.is_recurrent:
-    #             head_net = self.q_networks[self.current_head]
-    #             if hasattr(head_net, 'rnn'):
-    #                 head_net.rnn.flatten_parameters()
-    #             q_values, state = head_net(observation_tensor, state)
-    #         else:
-    #             if use_ensemble:
-    #                 q_values = torch.stack([q_net(observation_tensor) for q_net in self.q_networks])
-    #                 q_values = q_values.mean(dim=0)
-    #             else:
-    #                 q_values = self.q_networks[self.current_head](observation_tensor)
-            
-    #         # If action masking is enabled, adjust the mask to match q_values' shape.
-    #         # if kwargs.get('use_masking', False):
-    #         raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
-    #         mask = adjust_action_mask(raw_mask, q_values.shape)
-    #         q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))
-            
-    #         actions = torch.argmax(q_values, dim=1).cpu().numpy()
-    #     return actions, state    
+                          self.target_q_networks[i].parameters(),
+                          self.tau)
 
     def predict(self, observation, hidden=None, use_ensemble=False):
-        # Convert observation (numpy array of shape (obs_dim,)) to tensor with sequence length 1.
-        obs = torch.tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(1)
+        # If observations are token sequences (e.g. a list or array of token indices),
+        # we only add the batch dimension.
+        if isinstance(observation, (list, np.ndarray)):
+            obs = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
+            if obs.dim() == 1:
+                obs = obs.unsqueeze(0)
+        else:
+            obs = observation.to(self.device)
         with torch.no_grad():
             if use_ensemble:
-                # Average Q-values over all heads.
                 qs = []
                 for net in self.q_networks:
                     q, hidden_out = net(obs, hidden)
                     qs.append(q)
                 q_values = torch.stack(qs, dim=0).mean(dim=0)
             else:
-                # Use the current head.
                 q_values, hidden_out = self.q_networks[self.current_head](obs, hidden)
-        # Select the action with the maximum Q-value.
-
-        # action masking
         raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
         mask = adjust_action_mask(raw_mask, q_values.shape)
         q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))
-
         action = torch.argmax(q_values, dim=1).cpu().numpy()
         return action, hidden_out
-    def _sample_action(
-        self,
-        learning_starts: int,
-        action_noise: Optional[ActionNoise] = None,
-        n_envs: int = 1,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Sample an action using epsilon–greedy exploration.
-        """
+
+    def _sample_action(self, learning_starts: int, action_noise=None, n_envs: int = 1):
         if self.num_timesteps < learning_starts or np.random.rand() < self.exploration_rate:
             action_masks = torch.as_tensor(get_action_masks(self.env)).cpu().numpy()
             valid_actions = [np.where(action_masks[i])[0] for i in range(n_envs)]
             unscaled_action = np.array([np.random.choice(valid_actions[i]) for i in range(n_envs)])
         else:
             unscaled_action, _ = self.predict(self._last_obs, use_ensemble=False)
-        
         if isinstance(self.action_space, spaces.Box):
             scaled_action = self.policy.scale_action(unscaled_action)
             if action_noise is not None:
@@ -349,6 +231,7 @@ class BootstrappedDQN(DQN):
             buffer_action = unscaled_action
             action = buffer_action
         return action, buffer_action
+
     
 class MaskDQN(DQN):
     def __init__(self, *args, **kwargs):

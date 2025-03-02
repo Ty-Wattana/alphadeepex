@@ -114,7 +114,7 @@ class CustomCallback(BaseCallback):
         self.logger.record(f'test/ic_mean', ic_test_mean)
         self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
         
-        if self.num_timesteps % 2048 == 0:
+        if self.num_timesteps % 1000 == 0:
             self.save_checkpoint()
 
     def save_checkpoint(self):
