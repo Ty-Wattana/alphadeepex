@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import copy
 from stable_baselines3 import DQN
+from stable_baselines3 import HerReplayBuffer
 from gymnasium import spaces
 from sb3_contrib.common.maskable.utils import get_action_masks
 
@@ -61,7 +62,6 @@ class LSTMQNet(nn.Module):
             elif obs.dim() == 5:
                 batch, seq_len, c, h, w = obs.size()
                 obs = obs.view(batch, seq_len, c * h * w)
-            # Otherwise assume obs is already in (batch, seq_len, features) or (batch, features)
             # If obs is 2D (batch, features), add a sequence dimension.
             elif obs.dim() == 2:
                 obs = obs.unsqueeze(1)
@@ -72,17 +72,13 @@ class LSTMQNet(nn.Module):
         features = self.extract_features(obs)
         features = features.float()
         features = F.relu(self.fc(features))
-        # Flatten LSTM parameters to ensure they are contiguous in memory.
         self.lstm.flatten_parameters()
-        # If no hidden state is passed, initialize with zeros.
         if hidden is None:
             batch = features.size(0)
             h0 = torch.zeros(1, batch, self.hidden_dim, device=features.device)
             c0 = torch.zeros(1, batch, self.hidden_dim, device=features.device)
             hidden = (h0, c0)
-        # Process through LSTM.
         x, hidden = self.lstm(features, hidden)
-        # Use the output of the last time step.
         x = x[:, -1, :]
         q_values = self.out(x)
         return q_values, hidden
@@ -100,18 +96,22 @@ class BootstrappedDQN(DQN):
         embedding_dim: int = None,
         **kwargs,
     ):
+        # IMPORTANT: Pass HERReplayBuffer as the replay_buffer_class
         super().__init__(policy, env, **kwargs)
         self.num_bootstrapped_nets = num_bootstrapped_nets
         self.mask_prob = mask_prob
         self.device = device
 
         # Get environment dimensions.
-        # If using token sequences, input_dim should be set to the sequence length (or token feature dim)
-        obs_dim = env.observation_space.shape[0]
+        # If using token sequences, input_dim should be the sequence length
+        if isinstance(env.observation_space, spaces.Dict):
+            # Use the 'observation' part for network input.
+            obs_dim = env.observation_space.spaces["observation"].shape[0]
+        else:
+            obs_dim = env.observation_space.shape[0]
         num_actions = env.action_space.n
         hidden_dim = 64  # arbitrary hidden dimension
 
-        # Create independent copies of the Q-network and its target network for each head.
         self.q_networks = nn.ModuleList([
             copy.deepcopy(LSTMQNet(obs_dim, hidden_dim, num_actions, vocab_size, embedding_dim).to(device))
             for _ in range(num_bootstrapped_nets)
@@ -119,9 +119,7 @@ class BootstrappedDQN(DQN):
         self.target_q_networks = nn.ModuleList([
             copy.deepcopy(net) for net in self.q_networks
         ])
-        # For simplicity we use a single optimizer over all network parameters.
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        # For deep exploration: current_head indicates which head to follow this episode.
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
     def parameters(self):
@@ -131,7 +129,6 @@ class BootstrappedDQN(DQN):
         return params
 
     def sample_episode_head(self):
-        """Call this at the beginning of each episode to choose a head for deep exploration."""
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
     def _sample_bootstrapped_masks(self, batch_size: int) -> torch.Tensor:
@@ -147,19 +144,22 @@ class BootstrappedDQN(DQN):
         self._update_learning_rate(self.policy.optimizer)
         batch = self.replay_buffer.sample(batch_size)
 
-        obs = batch.observations.to(self.device)
+        # If observations come as a dict (from HERReplayBuffer), extract the "observation" field.
+        if isinstance(batch.observations, dict):
+            obs = batch.observations["observation"].to(self.device)
+            next_obs = batch.next_observations["observation"].to(self.device)
+        else:
+            obs = batch.observations.to(self.device)
+            next_obs = batch.next_observations.to(self.device)
+
         actions = batch.actions.long().to(self.device)
         rewards = batch.rewards.float().to(self.device)
-        next_obs = batch.next_observations.to(self.device)
         dones = batch.dones.float().to(self.device)
 
         reward_mean = torch.mean(rewards)
         self.logger.record("train/mean_reward", reward_mean.item())
 
-        # Here, we assume each observation is already a token sequence.
-        # (If using continuous observations, adjust accordingly.)
-        hidden = None  # For training, you might consider preserving hidden state across tokens.
-
+        hidden = None  # Reset hidden state for training
         masks = self._sample_bootstrapped_masks(batch_size)
         losses = []
         for i in range(self.num_bootstrapped_nets):
@@ -169,7 +169,6 @@ class BootstrappedDQN(DQN):
                 rewards_squeezed = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
                 dones_squeezed = dones.squeeze(-1) if dones.dim() > 1 else dones
                 target_q = rewards_squeezed + self.gamma * (1 - dones_squeezed) * next_max_q
-                # target_q = rewards + self.gamma * (1 - dones) * next_max_q
 
             current_q, _ = self.q_networks[i](obs, hidden)
             if current_q.dim() > 2:
@@ -191,23 +190,25 @@ class BootstrappedDQN(DQN):
                           self.tau)
 
     def predict(self, observation, hidden=None, use_ensemble=False):
-        # If observations are token sequences (e.g. a list or array of token indices),
-        # we only add the batch dimension.
-        if isinstance(observation, (list, np.ndarray)):
-            obs = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
-            if obs.dim() == 1:
-                obs = obs.unsqueeze(0)
+        # If observation is dict (as in HER), extract the "observation" component.
+        if isinstance(observation, dict):
+            obs_tensor = torch.tensor(observation["observation"], dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
+        elif isinstance(observation, (list, np.ndarray)):
+            obs_tensor = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
         else:
-            obs = observation.to(self.device)
+            obs_tensor = observation.to(self.device)
+
         with torch.no_grad():
             if use_ensemble:
                 qs = []
                 for net in self.q_networks:
-                    q, hidden_out = net(obs, hidden)
+                    q, hidden_out = net(obs_tensor, hidden)
                     qs.append(q)
                 q_values = torch.stack(qs, dim=0).mean(dim=0)
             else:
-                q_values, hidden_out = self.q_networks[self.current_head](obs, hidden)
+                q_values, hidden_out = self.q_networks[self.current_head](obs_tensor, hidden)
         raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
         mask = adjust_action_mask(raw_mask, q_values.shape)
         q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))

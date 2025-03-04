@@ -19,6 +19,7 @@ from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.system_prompt import EXPLAIN_WITH_TEXT_DESC
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
 from alphagen.rl.policy import LSTMSharedNet
+from stable_baselines3 import HerReplayBuffer
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
@@ -114,7 +115,7 @@ class CustomCallback(BaseCallback):
         self.logger.record(f'test/ic_mean', ic_test_mean)
         self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
         
-        if self.num_timesteps % 1000 == 0:
+        if self.num_timesteps % 100 == 0:
             self.save_checkpoint()
 
     def save_checkpoint(self):
@@ -254,6 +255,7 @@ def run_single_experiment(
         device=device,
         print_expr=True,
         constrain = True,
+        # her = True
     )
     checkpoint_callback = CustomCallback(
         save_path=save_path,
@@ -264,10 +266,10 @@ def run_single_experiment(
         drop_rl_n=drop_rl_n
     )
     model = BootstrappedDQN(
-        policy="MlpPolicy",
+        policy="MultiInputPolicy",
         env=env,
         train_freq=(1, "episode"),
-        num_bootstrapped_nets=10,
+        num_bootstrapped_nets=20,
         mask_prob=0.8,
         learning_rate=1e-4,
         buffer_size=100000,
@@ -278,16 +280,21 @@ def run_single_experiment(
         exploration_final_eps=0.01,
         verbose=1,
         learning_starts=1000,
-        tensorboard_log="./out/boot_tensorboard",
-        policy_kwargs=dict(
-            features_extractor_class=LSTMSharedNet,
-            features_extractor_kwargs=dict(
-                n_layers=2,
-                d_model=128,
-                dropout=0.1,
-                device=device,
+        replay_buffer_class=HerReplayBuffer,
+        replay_buffer_kwargs=dict(
+            n_sampled_goal=4,
+            goal_selection_strategy="future",
             ),
-        ),
+        tensorboard_log="./out/boot_tensorboard",
+        # policy_kwargs=dict(
+        #     features_extractor_class=LSTMSharedNet,
+        #     features_extractor_kwargs=dict(
+        #         n_layers=2,
+        #         d_model=128,
+        #         dropout=0.1,
+        #         device=device,
+        #     ),
+        # ),
     )
     model.learn(
         total_timesteps=steps,
