@@ -31,18 +31,22 @@ class AlphaDenseEnv(AlphaEnvCore):
     Override the step method to make a reward-dense environment.
     """
     def step(self, action: Token) -> Tuple[List[Token], float, bool, bool, dict]:
+        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2
         if (isinstance(action, SequenceIndicatorToken) and
                 action.indicator == SequenceIndicatorType.SEP):
             reward = self._evaluate()
+            reward -= len_penalty
             done = True
         elif len(self._tokens) < MAX_EXPR_LENGTH:
             self._tokens.append(action)
             self._builder.add_token(action)
             done = False
             reward = self._evaluate() if self._builder.is_valid() else 0
+            reward -= len_penalty
         else:
             done = True
             reward = self._evaluate() if self._builder.is_valid() else -1.
+            reward -= len_penalty
 
         if math.isnan(reward):
             reward = 0.
@@ -201,11 +205,13 @@ class AlphaEnvGoal(gym.Env):
     def step(self, action: 'Token') -> Tuple[Dict, float, bool, bool, dict]:
         done = False
         reward = 0.0
+        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2
 
         # If a special token indicating termination is received, evaluate the expression.
         if (isinstance(action, SequenceIndicatorToken) and 
                 action.indicator == SequenceIndicatorType.SEP):
             self._achieved_goal = self._evaluate()
+            self._achieved_goal -= len_penalty
             done = True
             reward = self.compute_reward(self._achieved_goal, self.desired_goal, self._valid_action_types())
         elif len(self._tokens) < self.MAX_EXPR_LENGTH:
@@ -214,6 +220,7 @@ class AlphaEnvGoal(gym.Env):
             done = False
             if self._builder.is_valid():
                 self._achieved_goal = self._evaluate()
+                self._achieved_goal -= len_penalty
                 # reward = self.compute_reward(self._achieved_goal, self.desired_goal, self._valid_action_types())
                 reward = 0.0
             else:
@@ -224,6 +231,7 @@ class AlphaEnvGoal(gym.Env):
             done = True
             if self._builder.is_valid():
                 self._achieved_goal = self._evaluate()
+                self._achieved_goal -= len_penalty
                 reward = self.compute_reward(self._achieved_goal, self.desired_goal, self._valid_action_types())
             else:
                 reward = -1.0
