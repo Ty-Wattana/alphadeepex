@@ -8,6 +8,7 @@ from alphagen.utils import reseed_everything
 from alphagen.data.tree import ExpressionBuilder
 import gymnasium as gym
 from gymnasium import spaces
+import copy
 # from gym import spaces
 # import gym
 
@@ -29,6 +30,7 @@ class AlphaDenseEnv(AlphaEnvCore):
 
     """"
     Override the step method to make a reward-dense environment.
+    Add MCST methods
     """
     def step(self, action: Token) -> Tuple[List[Token], float, bool, bool, dict]:
         len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2
@@ -52,6 +54,34 @@ class AlphaDenseEnv(AlphaEnvCore):
             reward = 0.
 
         return self._tokens, reward, done, False, self._valid_action_types()
+    
+    def get_state(self) -> dict:
+        """
+        Returns a snapshot of the internal state.
+        We include the current tokens, the builder state, and evaluation count.
+        """
+        return {
+            "tokens": copy.deepcopy(self._tokens),
+            "builder": copy.deepcopy(self._builder),
+            "eval_cnt": self.eval_cnt,
+            "render_mode": self.render_mode
+        }
+    
+    def set_state(self, state: dict) -> None:
+        """
+        Restores the internal state from the given snapshot.
+        """
+        self._tokens = copy.deepcopy(state["tokens"])
+        self._builder = copy.deepcopy(state["builder"])
+        self.eval_cnt = state["eval_cnt"]
+        self.render_mode = state.get("render_mode", None)
+
+    def get_obs(self) -> List[Token]:
+        """
+        Returns the current observation.
+        Here we simply return the tokens list.
+        """
+        return self._tokens
     
 class AlphaStrictEnvDense(AlphaEnvWrapper):
 
