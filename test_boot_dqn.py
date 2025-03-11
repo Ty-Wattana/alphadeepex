@@ -255,6 +255,7 @@ def run_single_experiment(
         device=device,
         print_expr=True,
         constrain = True,
+        penalty = True
         # her = True
     )
     checkpoint_callback = CustomCallback(
@@ -266,7 +267,8 @@ def run_single_experiment(
         drop_rl_n=drop_rl_n
     )
     model = BootstrappedDQN(
-        policy="MultiInputPolicy",
+        policy="MlpPolicy",
+        # policy="MultiInputPolicy",
         env=env,
         train_freq=(1, "episode"),
         num_bootstrapped_nets=20,
@@ -276,25 +278,25 @@ def run_single_experiment(
         batch_size=128,
         gamma=0.99,
         target_update_interval=1000,
-        exploration_fraction=0.1,
-        exploration_final_eps=0.01,
+        exploration_fraction=0.2,
+        exploration_final_eps=0.1,
         verbose=1,
         learning_starts=1000,
-        replay_buffer_class=HerReplayBuffer,
-        replay_buffer_kwargs=dict(
-            n_sampled_goal=4,
-            goal_selection_strategy="future",
-            ),
-        tensorboard_log="./out/boot_tensorboard",
-        # policy_kwargs=dict(
-        #     features_extractor_class=LSTMSharedNet,
-        #     features_extractor_kwargs=dict(
-        #         n_layers=2,
-        #         d_model=128,
-        #         dropout=0.1,
-        #         device=device,
+        # replay_buffer_class=HerReplayBuffer,
+        # replay_buffer_kwargs=dict(
+        #     n_sampled_goal=4,
+        #     goal_selection_strategy="future",
         #     ),
-        # ),
+        tensorboard_log="./out/boot_tensorboard",
+        policy_kwargs=dict(
+            features_extractor_class=LSTMSharedNet,
+            features_extractor_kwargs=dict(
+                n_layers=2,
+                d_model=128,
+                dropout=0.1,
+                device=device,
+            ),
+        ),
     )
     model.learn(
         total_timesteps=steps,

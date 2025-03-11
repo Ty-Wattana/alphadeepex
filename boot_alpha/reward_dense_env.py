@@ -28,12 +28,40 @@ SIZE_ACTION = SIZE_OP + SIZE_FEATURE + SIZE_DELTA_TIME + SIZE_CONSTANT + SIZE_SE
 
 class AlphaDenseEnv(AlphaEnvCore):
 
+    pool: AlphaPoolBase
+    _tokens: List[Token]
+    _builder: ExpressionBuilder
+    _print_expr: bool
+
+    def __init__(
+        self,
+        pool: AlphaPoolBase,
+        device: torch.device = torch.device('cuda:0'),
+        penalty: bool = False,
+        print_expr: bool = False
+    ):
+        super().__init__(
+            pool=pool,
+            device=device,
+            print_expr=print_expr,
+        )
+
+        self.pool = pool
+        self._print_expr = print_expr
+        self.penalty = penalty
+        self._device = device
+
+        self.eval_cnt = 0
+
+        self.render_mode = None
+        self.reset()
+
     """"
     Override the step method to make a reward-dense environment.
     Add MCST methods
     """
     def step(self, action: Token) -> Tuple[List[Token], float, bool, bool, dict]:
-        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2
+        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2 if self.penalty else 0
         if (isinstance(action, SequenceIndicatorToken) and
                 action.indicator == SequenceIndicatorType.SEP):
             reward = self._evaluate()
@@ -131,6 +159,7 @@ class AlphaEnvGoal(gym.Env):
         pool: 'AlphaPoolBase',
         desired_goal: float,
         device: torch.device = torch.device('cuda:0'),
+        penalty: bool = False,
         print_expr: bool = False,
         tolerance: float = 1e-3
     ):
@@ -138,6 +167,7 @@ class AlphaEnvGoal(gym.Env):
         self.pool = pool
         self.desired_goal = desired_goal  # target value for the expression
         self._print_expr = print_expr
+        self.penalty = penalty,
         self._device = device
         self.tolerance = tolerance
         self.eval_cnt = 0
@@ -235,7 +265,7 @@ class AlphaEnvGoal(gym.Env):
     def step(self, action: 'Token') -> Tuple[Dict, float, bool, bool, dict]:
         done = False
         reward = 0.0
-        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2
+        len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2 if self.penalty else 0
 
         # If a special token indicating termination is received, evaluate the expression.
         if (isinstance(action, SequenceIndicatorToken) and 
@@ -453,14 +483,14 @@ class AlphaEnvHERWrapper(gym.Wrapper):
             return SequenceIndicatorToken(SequenceIndicatorType.SEP)
         assert False, "Invalid action index"
 
-def AlphaEnvDense(pool: AlphaPoolBase, subexprs: Optional[List[Expression]] = None, constrain: bool = False, her=False, **kwargs):
+def AlphaEnvDense(pool: AlphaPoolBase, subexprs: Optional[List[Expression]] = None, constrain: bool = False, her=False, penalty=False, **kwargs):
     if constrain:
         if her:
-            return AlphaEnvHERWrapper(AlphaEnvGoal(pool=pool,desired_goal=0.1, **kwargs), subexprs=subexprs)
+            return AlphaEnvHERWrapper(AlphaEnvGoal(pool=pool,desired_goal=0.1,penalty=penalty, **kwargs), subexprs=subexprs)
         else:
-            return AlphaStrictEnvDense(AlphaDenseEnv(pool=pool, **kwargs), subexprs=subexprs)
+            return AlphaStrictEnvDense(AlphaDenseEnv(pool=pool,penalty=penalty, **kwargs), subexprs=subexprs)
     else:
         if  her:
-            return AlphaEnvHERWrapper(AlphaEnvGoal(pool=pool,desired_goal=0.1, **kwargs), subexprs=subexprs)
+            return AlphaEnvHERWrapper(AlphaEnvGoal(pool=pool,desired_goal=0.1,penalty=penalty, **kwargs), subexprs=subexprs)
         else:
-            return AlphaEnvWrapper(AlphaDenseEnv(pool=pool, **kwargs), subexprs=subexprs)
+            return AlphaEnvWrapper(AlphaDenseEnv(pool=pool, penalty=penalty, **kwargs), subexprs=subexprs)
