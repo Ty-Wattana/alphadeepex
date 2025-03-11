@@ -159,7 +159,7 @@ if __name__ == "__main__":
 
     def run_backtest(prefix: str, seed: int, exprs: List[Expression], weights: List[float]):
         df = data.make_dataframe(calc.make_ensemble_alpha(exprs, weights))
-        qlib_backtest.run(df, output_prefix=f"out/backtests/50-5/{prefix}/{seed}")
+        qlib_backtest.run(df, output_prefix=f"out/backtests/51-5/{prefix}/{seed}")
 
     for p in Path("out/gp").iterdir():
         seed = int(p.name)
@@ -182,7 +182,7 @@ if __name__ == "__main__":
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "250624_steps_pool.json"))
+            exprs, weights = load_alpha_pool_by_path(str(p / "249500_steps_pool.json"))
         except:
             continue
         run_backtest(ver, seed, exprs, weights)
