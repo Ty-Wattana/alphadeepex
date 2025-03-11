@@ -3,6 +3,8 @@ import random
 import copy
 import json
 import os
+import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -11,10 +13,12 @@ import gymnasium as gym
 from gymnasium import spaces
 
 # Import BaseAlgorithm and a dummy policy class.
+from stable_baselines3.common import utils
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.dqn.policies import MlpPolicy
 from stable_baselines3.common.type_aliases import MaybeCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
+from stable_baselines3.common.utils import safe_mean
 
 from alphagen.config import MAX_EXPR_LENGTH
 
@@ -145,7 +149,7 @@ class MCTSAlgorithm(BaseAlgorithm):
     """
     def __init__(self,
                  env: Union[str, gym.Env],
-                 n_simulations: int = 100,
+                 n_simulations: int = 10,
                  c_param: float = 1.41,
                  discount: float = 1.0,
                  **kwargs):
@@ -206,13 +210,18 @@ class MCTSAlgorithm(BaseAlgorithm):
 
     def learn(self,
               total_timesteps: int,
-              callback: Optional[Any] = None,
+              callback: MaybeCallback = None,
+              log_interval: int = 1,
               tb_log_name: str = "run",
               reset_num_timesteps: bool = True,
               progress_bar: bool = False) -> "MCTSAlgorithm":
         self.num_timesteps = 0
+        iteration = 0
         if callback is not None:
+            self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            callback = self._init_callback(callback, progress_bar)
             callback.on_training_start(locals(), globals())
+
         while self.num_timesteps < total_timesteps:
             obs = self.env.reset()
             done = False
@@ -223,6 +232,17 @@ class MCTSAlgorithm(BaseAlgorithm):
                 if callback is not None and callback._on_step() is False:
                     callback.on_training_end()
                     return self
+                
+                # Display training infos
+                if log_interval is not None and iteration % log_interval == 0:
+                    time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                    fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                    self.logger.record("time/iterations", iteration, exclude="tensorboard")
+                    
+                    self.logger.record("time/fps", fps)
+                    self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+                    self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                    self.logger.dump(step=self.num_timesteps)
             if callback is not None:
                 callback.on_rollout_end()
         if callback is not None:

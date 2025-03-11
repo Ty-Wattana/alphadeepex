@@ -380,7 +380,10 @@ class CustomCallback(BaseCallback):
 
     @property
     def env_core(self) -> AlphaEnvCore:
-        return self.training_env.envs[0].unwrapped  # type: ignore
+        if hasattr(self.training_env, "envs"):
+            return self.training_env.envs[0].unwrapped
+        else:
+            return self.training_env.unwrapped
 
 
 def run_single_experiment(
@@ -413,7 +416,7 @@ def run_single_experiment(
     # tag = "rlv2" if llm_add_subexpr == 0 else f"afs{llm_add_subexpr}aar1-5"
     tag = (
         "agpt" if alphagpt_init else
-        "boot" if not use_llm else
+        "mcts" if not use_llm else
         f"llm_d{drop_rl_n}")
     name_prefix = f"{instruments}_{pool_capacity}_{seed}_{timestamp}_{tag}"
     save_path = os.path.join("./out/risk_miner", name_prefix)
@@ -468,7 +471,9 @@ def run_single_experiment(
         pool=pool,
         device=device,
         print_expr=True,
-        # constrain = True
+        # penalty = True,
+        # constrain = True,
+        # her = True
     )
     checkpoint_callback = CustomCallback(
         save_path=save_path,
@@ -484,7 +489,7 @@ def run_single_experiment(
         env=env, 
         policy_kwargs=policy_kwargs, 
         verbose=1,
-        tensorboard_log="./out/tensorboard",
+        tensorboard_log="./out/riskminer_tensorboard",
         # learning_starts=1000
         )
     model.learn(
