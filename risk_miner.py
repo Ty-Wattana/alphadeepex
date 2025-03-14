@@ -309,6 +309,7 @@ class CustomCallback(BaseCallback):
         self.logger.record('pool/significant', (np.abs(self.pool.weights[:self.pool.size]) > 1e-4).sum())
         self.logger.record('pool/best_ic_ret', self.pool.best_ic_ret)
         self.logger.record('pool/eval_cnt', self.pool.eval_cnt)
+        self.logger.record('pool/expr_len', len(self.env_core._tokens))
         n_days = sum(calculator.data.n_days for calculator in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         for i, test_calculator in enumerate(self.test_calculators, start=1):
@@ -319,7 +320,8 @@ class CustomCallback(BaseCallback):
             self.logger.record(f'test/rank_ic_{i}', rank_ic_test)
         self.logger.record(f'test/ic_mean', ic_test_mean)
         self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
-        
+
+        self.save_checkpoint()
         # if self.num_timesteps % 2048 == 0:
         #     self.save_checkpoint()
 

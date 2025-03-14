@@ -243,6 +243,8 @@ class MCTSAlgorithm(BaseAlgorithm):
                     self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
                     self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
                     self.logger.dump(step=self.num_timesteps)
+
+            callback.update_locals(locals())
             if callback is not None:
                 callback.on_rollout_end()
         if callback is not None:
