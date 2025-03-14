@@ -57,9 +57,24 @@ class AlphaDenseEnv(AlphaEnvCore):
         self.reset()
 
     """"
+    Add _inter_reward method to compute the reward for each step.
+
     Override the step method to make a reward-dense environment.
     Add MCST methods
     """
+
+    def _inter_reward(self, lamda: float = 0.5) -> float:
+        expr: Expression = self._builder.get_tree()
+        try:
+            ic_ret, ic_mut = self.pool._calc_ics(expr, ic_mut_threshold=0.99)
+            current_pool = self.pool.exprs.copy()
+            k = len(current_pool) - current_pool.count(None)
+            reward_inter = ic_ret - (lamda*sum(ic_mut))/k if k != 0 and ic_mut is not None else ic_ret
+            self.eval_cnt += 1
+        except:
+            reward_inter = 0
+        return reward_inter
+    
     def step(self, action: Token) -> Tuple[List[Token], float, bool, bool, dict]:
         len_penalty = (len(self._tokens)/MAX_EXPR_LENGTH)/2 if self.penalty else 0
         if (isinstance(action, SequenceIndicatorToken) and
@@ -71,8 +86,11 @@ class AlphaDenseEnv(AlphaEnvCore):
             self._tokens.append(action)
             self._builder.add_token(action)
             done = False
-            reward = self._evaluate() if self._builder.is_valid() else 0
+            reward = self._inter_reward() if self._builder.is_valid() else 0
             reward -= len_penalty
+
+            if all(elem is None for elem in self.pool.exprs) and self._builder.is_valid():
+                self._evaluate()
         else:
             done = True
             reward = self._evaluate() if self._builder.is_valid() else -1.
