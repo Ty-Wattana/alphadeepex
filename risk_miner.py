@@ -19,7 +19,7 @@ from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.system_prompt import EXPLAIN_WITH_TEXT_DESC
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
 from alphagen.rl.policy import LSTMSharedNet
-from riskminer.risk_mcts import MCTSAlgorithm
+from riskminer.risk_mcts import MCTSAlgorithm, RiskMCTSAlgorithm
 from sb3_contrib import QRDQN
 from sb3_contrib.common.maskable.utils import get_action_masks
 from typing import Dict
@@ -32,7 +32,6 @@ from typing import List, Optional
 from typing import TypeVar
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 
-from sb3_contrib.ppo_mask import MaskablePPO
 from gymnasium import spaces
 from boot_alpha.reward_dense_env import AlphaEnvDense
 from stable_baselines3.common.noise import ActionNoise
@@ -485,20 +484,48 @@ def run_single_experiment(
         llm_every_n_steps=llm_every_n_steps,
         drop_rl_n=drop_rl_n
     )
-    policy_kwargs = dict(n_quantiles=50)
-    model = MCTSAlgorithm(
-        # policy="MlpPolicy", 
-        env=env, 
-        policy_kwargs=policy_kwargs, 
-        verbose=1,
+    # policy_kwargs = dict(n_quantiles=50)
+    # model = MCTSAlgorithm(
+    #     env=env, 
+    #     policy_kwargs=policy_kwargs, 
+    #     verbose=1,
+    #     tensorboard_log="./out/riskminer_tensorboard",
+    #     )
+    
+    # model.learn(
+    #             total_timesteps=steps, 
+    #             callback=checkpoint_callback, 
+    #             tb_log_name=name_prefix
+    #             )
+    
+    policy_net_kwargs = {
+        "input_dim": env.observation_space.shape[0],  # dimension of observation
+        "hidden_dim": 64,                              # GRU hidden dimension
+        "num_layers": 1,                               # number of GRU layers
+        "action_dim": env.action_space.n,              # number of actions
+        "mlp_hidden_sizes": [32, 32],                  # MLP hidden layers
+        "lr": 0.001                                    # learning rate
+    }
+    model = RiskMCTSAlgorithm(
+        env=env,
+        policy_net_kwargs=policy_net_kwargs,
+        n_simulations=10,   # number of MCTS simulations per planning step
+        c_param=1.41,
+        alpha=0.7,          # risk-seeking quantile level
+        replay_size=1000,   # smaller replay size for demo purposes
+        batch_size=32,
         tensorboard_log="./out/riskminer_tensorboard",
-        # learning_starts=1000
-        )
+        gamma=1.0
+    )
+
     model.learn(
-                total_timesteps=steps, 
-                callback=checkpoint_callback, 
-                tb_log_name=name_prefix
-                )
+        total_timesteps=steps,
+        callback=checkpoint_callback,
+        log_interval=10,
+        tb_log_name=name_prefix,
+        reset_num_timesteps=True,
+        progress_bar=True
+    )
 
 
 def main(

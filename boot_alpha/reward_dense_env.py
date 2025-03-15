@@ -50,6 +50,7 @@ class AlphaDenseEnv(AlphaEnvCore):
         self._print_expr = print_expr
         self.penalty = penalty
         self._device = device
+        self.num_envs = 1
 
         self.eval_cnt = 0
 
