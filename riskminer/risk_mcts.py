@@ -382,9 +382,21 @@ class RiskMCTSNode:
 # --- Risk-Seeking Policy Network with Policy Gradient Update ---
 
 class RiskSeekerPolicy(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, action_dim: int, mlp_hidden_sizes: List[int] = [32, 32], lr: float = 0.001):
+    def __init__(self, 
+                 input_dim: int, 
+                 hidden_dim: int, 
+                 num_layers: int, 
+                 action_dim: int, 
+                 mlp_hidden_sizes: List[int] = [32, 32], 
+                 lr: float = 0.001,
+                 device: Optional[str] = None):
         super(RiskSeekerPolicy, self).__init__()
-        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True)
+        # Determine device: use GPU if available, otherwise CPU.
+        self.device = th.device("cuda" if th.cuda.is_available() else "cpu") if device is None else th.device(device)
+        
+        # GRU layer expects input of shape (batch, seq_len, input_dim)
+        self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True).to(self.device)
+        
         mlp_input_dim = hidden_dim
         layers = []
         last_dim = mlp_input_dim
@@ -393,38 +405,36 @@ class RiskSeekerPolicy(nn.Module):
             layers.append(nn.ReLU())
             last_dim = size
         layers.append(nn.Linear(last_dim, action_dim))
-        self.mlp = nn.Sequential(*layers)
+        self.mlp = nn.Sequential(*layers).to(self.device)
+        
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
-    
+        self.to(self.device)
+
     def forward(self, x):
         # x: (batch, seq_len, input_dim)
         _, h_n = self.gru(x)
-        feature = h_n[-1]
+        feature = h_n[-1]  # Use the last layer's hidden state.
         logits = self.mlp(feature)
         return logits
 
     def get_prior(self, observation: Any) -> List[float]:
-        # Ensure observation has a batch dimension.
+        # If observation is a 1D array, reshape it to (1, 1, input_dim)
         if isinstance(observation, np.ndarray) and observation.ndim == 1:
             observation = observation.reshape(1, 1, -1)
-        x = th.tensor(observation, dtype=th.float32)
+        # Create tensor on the correct device.
+        x = th.tensor(observation, dtype=th.float32, device=self.device)
         logits = self.forward(x)
-        # Apply softmax to obtain a probability distribution.
+        # Compute softmax to get a probability distribution over actions.
         prior = th.softmax(logits, dim=-1).detach().cpu().numpy()[0]
         return prior.tolist()
 
-    def update_policy(self, trajectories: List[Dict[str, Any]], quantile: float, beta: float):
-        """
-        Update the policy network parameters using a risk-seeking objective.
-        For each trajectory (with cumulative return and log-probs), we use an indicator
-        function to focus on elite (high-return) trajectories as described in ﹤citecite_turn0file1.
-        """
-        loss = th.tensor(0.0, dtype=th.float32, requires_grad=True)
+    def update_policy(self, trajectories: List[Dict[str, Any]], quantile: float, beta: float) -> float:
+        loss = th.tensor(0.0, dtype=th.float32, requires_grad=True, device=self.device)
         for traj in trajectories:
             R = traj["return"]
             indicator = 1.0 if R <= quantile else 0.0
-            # Convert the list of log_probs to a torch tensor before summing.
-            log_probs = th.tensor(traj["log_probs"], dtype=th.float32)
+            # Convert list of log_probs to tensor.
+            log_probs = th.tensor(traj["log_probs"], dtype=th.float32, device=self.device)
             loss = loss + (-indicator * log_probs.sum())
         loss = loss / len(trajectories)
         self.optimizer.zero_grad()
@@ -444,20 +454,24 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                  replay_size: int = 10000,
                  batch_size: int = 256,
                  gamma: float = 1.0,
+                 device: Optional[str] = None,
                  **kwargs):
         # Use a dummy policy to satisfy BaseAlgorithm.
         super().__init__(policy=MlpPolicy, env=env, learning_rate=0.0, **kwargs)
         self.env = self.env.envs[0] if hasattr(self.env, "envs") else self.env
         self.n_simulations = n_simulations
         self.c_param = c_param
-        self.gamma = gamma  # Discount factor
+        self.gamma = gamma
         self.num_timesteps = 0
-        self.policy = None  # Not used in planning
+        self.policy = None  # Not used in planning.
+        self.device = th.device("cuda" if th.cuda.is_available() else "cpu") if device is None else th.device(device)
+        # Ensure the policy network gets the device information.
+        policy_net_kwargs["device"] = str(self.device)
         self.risk_policy = RiskSeekerPolicy(**policy_net_kwargs)
         self.replay_buffer = deque(maxlen=replay_size)
         self.batch_size = batch_size
-        self.alpha = alpha  # Risk-seeking quantile level (e.g., 0.7)
-        self.current_quantile = 0.0  # Initialize quantile threshold
+        self.alpha = alpha  # Risk-seeking quantile level.
+        self.current_quantile = 0.0  # Initialize quantile threshold.
 
     def _setup_model(self) -> None:
         pass
