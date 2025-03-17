@@ -321,7 +321,7 @@ class CustomCallback(BaseCallback):
         self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
 
         self.save_checkpoint()
-        # if self.num_timesteps % 2048 == 0:
+        # if self.num_timesteps % self.log_interval == 0:
         #     self.save_checkpoint()
 
     def on_training_start(self, locals_: Dict[str, Any], globals_: Dict[str, Any]) -> None:
@@ -513,7 +513,7 @@ def run_single_experiment(
         c_param=1.41,
         alpha=0.7,          # risk-seeking quantile level
         replay_size=1000,   # smaller replay size for demo purposes
-        batch_size=32,
+        batch_size=128,
         tensorboard_log="./out/riskminer_tensorboard",
         gamma=1.0
     )

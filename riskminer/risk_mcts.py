@@ -346,12 +346,13 @@ class RiskMCTSNode:
         if self.parent is not None:
             self.parent.backpropagate(reward)
 
-    def rollout(self, agent: "RiskMCTSAlgorithm", max_depth: int = MAX_EXPR_LENGTH) -> float:
+    def rollout(self, agent: "RiskMCTSAlgorithm", max_depth: int = MAX_EXPR_LENGTH) -> Tuple[float, List[float]]:
         current_state = self.env_state
         current_obs = self.obs
         total_reward = 0.0
         depth = 0
         discount = agent.gamma
+        log_probs = []
         while depth < max_depth:
             temp_env = copy.deepcopy(agent.env)
             restore_env_state(temp_env, current_state)
@@ -359,13 +360,16 @@ class RiskMCTSNode:
             legal = get_legal_actions(current_obs, mask, agent.action_space)
             if not legal:
                 break
-            # Use the risk policy network to sample an action based on its prior distribution.
+            # Use risk policy to get prior probabilities.
             prior_probs = agent.risk_policy.get_prior(current_obs)
             legal_probs = np.array([prior_probs[a] for a in legal])
             if legal_probs.sum() == 0:
                 legal_probs = np.ones_like(legal_probs)
             legal_probs /= legal_probs.sum()
             action = np.random.choice(legal, p=legal_probs)
+            # Compute log probability for the chosen action.
+            log_prob = np.log(legal_probs[legal.index(action)])
+            log_probs.append(log_prob)
             new_state, new_obs, reward, done, info = agent.simulate_action(current_state, action)
             total_reward += (discount ** depth) * reward
             depth += 1
@@ -373,7 +377,7 @@ class RiskMCTSNode:
                 break
             current_state = new_state
             current_obs = new_obs
-        return total_reward
+        return total_reward, log_probs
 
 # --- Risk-Seeking Policy Network with Policy Gradient Update ---
 
@@ -415,15 +419,18 @@ class RiskSeekerPolicy(nn.Module):
         For each trajectory (with cumulative return and log-probs), we use an indicator
         function to focus on elite (high-return) trajectories as described in ﹤citecite_turn0file1.
         """
-        loss = 0.0
+        loss = th.tensor(0.0, dtype=th.float32, requires_grad=True)
         for traj in trajectories:
             R = traj["return"]
-            indicator = 1.0 if R <= quantile else 0.0  # update only if trajectory return is below the quantile threshold
-            loss += -indicator * sum(traj["log_probs"])
+            indicator = 1.0 if R <= quantile else 0.0
+            # Convert the list of log_probs to a torch tensor before summing.
+            log_probs = th.tensor(traj["log_probs"], dtype=th.float32)
+            loss = loss + (-indicator * log_probs.sum())
         loss = loss / len(trajectories)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        return loss.item()
 
 # --- Risk-Seeking MCTS Algorithm Integrating Policy Gradients ---
 
@@ -431,7 +438,7 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
     def __init__(self, 
                  env: gym.Env,
                  policy_net_kwargs: Dict[str, Any],
-                 n_simulations: int = 200,
+                 n_simulations: int = 10,
                  c_param: float = 1.41,
                  alpha: float = 0.7,
                  replay_size: int = 10000,
@@ -469,19 +476,22 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         if isinstance(obs, dict):
             obs["action_mask"] = mask
         root = RiskMCTSNode(state, obs, action_mask=mask, prior=0.0)
+        # Run MCTS simulations and record trajectories.
         for _ in range(self.n_simulations):
             node = root
-            # Selection
+            # Selection & Expansion as before.
             while node.children and not node.done and node.is_fully_expanded(self):
                 node = node.best_child(self, self.c_param)
-            # Expansion
             if not node.done:
                 node = node.expand(self)
-            # Rollout
-            reward = node.rollout(self)
-            # Backpropagation
-            node.backpropagate(reward)
-            # (Optional: collect trajectory for risk policy update)
+            # Rollout phase now returns (reward, log_probs).
+            rollout_reward, rollout_log_probs = node.rollout(self)
+            # Backpropagation.
+            node.backpropagate(rollout_reward)
+            # Record the trajectory for policy update.
+            trajectory = {"return": rollout_reward, "log_probs": rollout_log_probs}
+            self.replay_buffer.append(trajectory)
+        # Choose best action from the root based on visits.
         best_action = None
         best_visits = -1
         for action, child in root.children.items():
@@ -501,10 +511,12 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         if len(self.replay_buffer) < self.batch_size:
             return
         trajectories = random.sample(self.replay_buffer, self.batch_size)
-        self.risk_policy.update_policy(trajectories, self.current_quantile, beta)
+        loss = self.risk_policy.update_policy(trajectories, self.current_quantile, beta)
         returns = [traj["return"] for traj in trajectories]
         indicator_mean = np.mean([1 if R <= self.current_quantile else 0 for R in returns])
         self.current_quantile += beta * (1 - self.alpha - indicator_mean)
+        # Log the loss to tensorboard
+        self.logger.record("train/loss", loss)
 
     def learn(self,
               total_timesteps: int,
@@ -518,18 +530,20 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         if callback is not None:
             self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
             callback = self._init_callback(callback, progress_bar)
+            callback.log_interval = log_interval
             callback.on_training_start(locals(), globals())
 
-        # Initialize timing info
         self.start_time = time.time_ns()
         self._num_timesteps_at_start = self.num_timesteps
 
         while self.num_timesteps < total_timesteps:
             obs = self.env.reset()
             done = False
+            episode_reward = 0.0  # accumulate reward per episode
             while not done and self.num_timesteps < total_timesteps:
                 action = self._plan_action()
                 obs, reward, done, truncated, info = self.env.step(action)
+                episode_reward += reward
                 self.num_timesteps += 1
 
                 if callback is not None and callback._on_step() is False:
@@ -544,14 +558,14 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                     self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
                     self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
                     self.logger.dump(step=self.num_timesteps)
-
                 iteration += 1
-                self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
+            # Log the cumulative reward for the episode
+            self.logger.record("train/episode_reward", episode_reward)
             if callback is not None:
                 callback.update_locals(locals())
                 callback.on_rollout_end()
-            # Optionally update risk policy at the end of each episode.
+            # Update risk policy (and log loss)
             self.update_risk_policy(beta=0.01)
         if callback is not None:
             callback.on_training_end()
