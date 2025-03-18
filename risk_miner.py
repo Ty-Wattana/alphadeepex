@@ -1,5 +1,6 @@
 import json
 import os
+import glob
 from typing import Optional, Tuple, List, Any
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,8 @@ from openai import OpenAI
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common import utils
+from torch.utils.tensorboard import SummaryWriter
 
 from alphagen.data.expression import *
 from alphagen.data.parser import ExpressionParser
@@ -274,6 +277,51 @@ def build_chat_client(log_dir: str) -> ChatClient:
         )
     )
 
+def load_linear_alpha_pool_from_json(json_path: str, 
+                                     calculator: QLibStockDataCalculator,
+                                     single_alpha: bool = False) -> LinearAlphaPool | list[LinearAlphaPool]:
+    # Load the JSON file
+    parser = ExpressionParser(Operators)
+    with open(json_path, 'r') as f:
+        pool_data = json.load(f)
+
+    # Extract expressions and weights from the loaded data
+    expressions = pool_data['exprs']
+    weights = pool_data['weights']
+
+    # Create an instance of LinearAlphaPool
+    alpha_pool = MseAlphaPool(
+        capacity=len(expressions),  # Set the capacity based on the number of expressions
+        calculator=calculator,
+        ic_lower_bound=None,
+        l1_alpha=5e-3,
+    )
+
+    # Load the expressions into the pool
+    expres = []
+    if single_alpha:
+        alpha_pools = []
+
+        for expression,weight in zip(expressions,weights):
+            alpha_pool = MseAlphaPool(
+                capacity=1,
+                calculator=calculator
+                )
+            expre = parser.parse(expression)
+            alpha_pool.force_load_exprs([expre], [weight])
+            alpha_pools.append(alpha_pool)
+
+        return  alpha_pools
+    else:
+        for expression in expressions:
+            expre = parser.parse(expression)
+            expres.append(expre)
+        
+        
+        alpha_pool.force_load_exprs(expres, weights)
+
+        return alpha_pool
+
 
 class CustomCallback(BaseCallback):
     def __init__(
@@ -283,13 +331,19 @@ class CustomCallback(BaseCallback):
         verbose: int = 0,
         chat_session: Optional[InterativeSession] = None,
         llm_every_n_steps: int = 25_000,
+        tb_log_name: str = "riskminer_tensorboard",
         drop_rl_n: int = 5
     ):
         super().__init__(verbose)
         self.save_path = save_path
         self.test_calculators = test_calculators
+        self.tb_log_name = tb_log_name
         os.makedirs(self.save_path, exist_ok=True)
 
+        # Create a SummaryWriter that does NOT purge the log (resume mode)
+        log_dir = f"./out/riskminer_tensorboard/{tb_log_name}"
+        self.writer = SummaryWriter(log_dir=log_dir)
+        
         self.llm_use_count = 0
         self.last_llm_use = 0
         self.obj_history: List[Tuple[int, float]] = []
@@ -304,33 +358,37 @@ class CustomCallback(BaseCallback):
         if self.chat_session is not None:
             self._try_use_llm()
 
-        self.logger.record('pool/size', self.pool.size)
-        self.logger.record('pool/significant', (np.abs(self.pool.weights[:self.pool.size]) > 1e-4).sum())
-        self.logger.record('pool/best_ic_ret', self.pool.best_ic_ret)
-        self.logger.record('pool/eval_cnt', self.pool.eval_cnt)
-        self.logger.record('pool/expr_len', len(self.env_core._tokens))
+        # Instead of self.logger.record, we use self.writer.add_scalar
+        self.writer.add_scalar('pool/size', self.pool.size, self.num_timesteps)
+        self.writer.add_scalar('pool/significant', (np.abs(self.pool.weights[:self.pool.size]) > 1e-4).sum(), self.num_timesteps)
+        self.writer.add_scalar('pool/best_ic_ret', self.pool.best_ic_ret, self.num_timesteps)
+        self.writer.add_scalar('pool/eval_cnt', self.pool.eval_cnt, self.num_timesteps)
+        self.writer.add_scalar('pool/expr_len', len(self.env_core._tokens), self.num_timesteps)
+
         n_days = sum(calculator.data.n_days for calculator in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         for i, test_calculator in enumerate(self.test_calculators, start=1):
             ic_test, rank_ic_test = self.pool.test_ensemble(test_calculator)
             ic_test_mean += ic_test * test_calculator.data.n_days / n_days
             rank_ic_test_mean += rank_ic_test * test_calculator.data.n_days / n_days
-            self.logger.record(f'test/ic_{i}', ic_test)
-            self.logger.record(f'test/rank_ic_{i}', rank_ic_test)
-        self.logger.record(f'test/ic_mean', ic_test_mean)
-        self.logger.record(f'test/rank_ic_mean', rank_ic_test_mean)
+            self.writer.add_scalar(f'test/ic_{i}', ic_test, self.num_timesteps)
+            self.writer.add_scalar(f'test/rank_ic_{i}', rank_ic_test, self.num_timesteps)
+        self.writer.add_scalar('test/ic_mean', ic_test_mean, self.num_timesteps)
+        self.writer.add_scalar('test/rank_ic_mean', rank_ic_test_mean, self.num_timesteps)
 
         self.save_checkpoint()
-        # if self.num_timesteps % self.log_interval == 0:
-        #     self.save_checkpoint()
 
     def on_training_start(self, locals_: Dict[str, Any], globals_: Dict[str, Any]) -> None:
-        # Save the local and global context for later use
         self.locals = locals_
         self.globals = globals_
-        # For MCTS, there is no model, so we initialize our timestep counter directly.
-        # You can either set it to zero or extract it from the algorithm if it stores a counter.
-        self.num_timesteps = locals_.get("self", None).num_timesteps if "self" in locals_ and hasattr(locals_["self"], "num_timesteps") else 0
+        # Resume num_timesteps if available
+        algo = locals_.get("self", None)
+        if algo is not None and hasattr(algo, "num_timesteps"):
+            self.num_timesteps = algo.num_timesteps
+        else:
+            self.num_timesteps = 0
+        if self.verbose:
+            print(f"Resuming training from timestep: {self.num_timesteps}")
         self._on_training_start()
     
     def save_checkpoint(self):
@@ -421,7 +479,7 @@ def run_single_experiment(
         f"llm_d{drop_rl_n}")
     name_prefix = f"{instruments}_{pool_capacity}_{seed}_{timestamp}_{tag}"
     save_path = os.path.join("./out/risk_miner", name_prefix)
-    os.makedirs(save_path, exist_ok=True)
+    # os.makedirs(save_path, exist_ok=True)
 
     device = torch.device("cuda:0")
     close = Feature(FeatureType.CLOSE)
@@ -476,27 +534,6 @@ def run_single_experiment(
         # constrain = True,
         # her = True
     )
-    checkpoint_callback = CustomCallback(
-        save_path=save_path,
-        test_calculators=calculators[1:],
-        verbose=1,
-        chat_session=inter,
-        llm_every_n_steps=llm_every_n_steps,
-        drop_rl_n=drop_rl_n
-    )
-    # policy_kwargs = dict(n_quantiles=50)
-    # model = MCTSAlgorithm(
-    #     env=env, 
-    #     policy_kwargs=policy_kwargs, 
-    #     verbose=1,
-    #     tensorboard_log="./out/riskminer_tensorboard",
-    #     )
-    
-    # model.learn(
-    #             total_timesteps=steps, 
-    #             callback=checkpoint_callback, 
-    #             tb_log_name=name_prefix
-    #             )
     
     policy_net_kwargs = {
         "input_dim": env.observation_space.shape[0],  # dimension of observation
@@ -506,26 +543,109 @@ def run_single_experiment(
         "mlp_hidden_sizes": [32, 32],                  # MLP hidden layers
         "lr": 0.001                                    # learning rate
     }
-    model = RiskMCTSAlgorithm(
-        env=env,
-        policy_net_kwargs=policy_net_kwargs,
-        n_simulations=10,   # number of MCTS simulations per planning step
-        c_param=1.41,
-        alpha=0.7,          # risk-seeking quantile level
-        replay_size=1000,   # smaller replay size for demo purposes
-        batch_size=128,
-        tensorboard_log="./out/riskminer_tensorboard",
-        gamma=1.0
-    )
+    
 
-    model.learn(
-        total_timesteps=steps,
-        callback=checkpoint_callback,
-        log_interval=10,
-        tb_log_name=name_prefix,
-        reset_num_timesteps=True,
-        progress_bar=True
-    )
+    """
+    Resume training or new.
+    """
+
+    # resume = False
+    resume = True
+
+    if resume:
+
+        all_subdirs = os.listdir('./out/risk_miner')
+        latest_subdir = all_subdirs[-1]
+        list_of_files = glob.glob(f'./out/risk_miner/{latest_subdir}/*.pt')
+
+        latest_file = max(list_of_files, key=os.path.getctime)
+        latest_step = int(latest_file.split("\\")[-1].split("_")[0])
+
+        list_of_pools = glob.glob(f'./out/risk_miner/{latest_subdir}/*.json')
+        latest_pool = max(list_of_pools, key=os.path.getctime)
+
+        latest_pool = load_linear_alpha_pool_from_json(latest_pool, calculator=calculators[0])
+
+        print(f"Resuming training from step {latest_step}...")
+        checkpoint_path = latest_file.replace("\\", "/")
+        name_prefix = os.listdir('out/riskminer_tensorboard')[-1]
+        save_path = f'./out/risk_miner/{latest_subdir}'
+
+        checkpoint_callback = CustomCallback(
+            save_path=save_path,
+            test_calculators=calculators[1:],
+            verbose=1,
+            chat_session=inter,
+            llm_every_n_steps=llm_every_n_steps,
+            drop_rl_n=drop_rl_n,
+            tb_log_name=name_prefix
+        )
+
+        # checkpoint_callback.pool = latest_pool
+        env = AlphaEnvDense(
+            pool=latest_pool,
+            device=device,
+            print_expr=True,
+            # penalty = True,
+            # constrain = True,
+            # her = True
+        )
+
+        model = RiskMCTSAlgorithm.load(checkpoint_path, env, policy_net_kwargs)
+        model.learn(
+            total_timesteps= steps - model.num_timesteps,
+            callback=checkpoint_callback,         # You can add a callback if desired.
+            log_interval=10,
+            progress_bar=True
+        )
+    else:
+        print("Starting new training...")
+        os.makedirs(save_path, exist_ok=True)
+
+        ## Vanila MCTS
+
+        # policy_kwargs = dict(n_quantiles=50)
+        # model = MCTSAlgorithm(
+        #     env=env, 
+        #     policy_kwargs=policy_kwargs, 
+        #     verbose=1,
+        #     tensorboard_log="./out/riskminer_tensorboard",
+        #     )
+        
+        # model.learn(
+        #             total_timesteps=steps, 
+        #             callback=checkpoint_callback, 
+        #             tb_log_name=name_prefix
+        #             )
+
+        checkpoint_callback = CustomCallback(
+            save_path=save_path,
+            test_calculators=calculators[1:],
+            verbose=1,
+            chat_session=inter,
+            llm_every_n_steps=llm_every_n_steps,
+            drop_rl_n=drop_rl_n,
+            tb_log_name=name_prefix
+        )
+
+        model = RiskMCTSAlgorithm(
+            env=env,
+            policy_net_kwargs=policy_net_kwargs,
+            n_simulations=10,   # number of MCTS simulations per planning step
+            c_param=1.41,
+            alpha=0.7,          # risk-seeking quantile level
+            replay_size=1000,   # smaller replay size for demo purposes
+            batch_size=128,
+            tensorboard_log="./out/riskminer_tensorboard",
+            gamma=1.0
+        )
+
+        model.learn(
+            total_timesteps=steps,
+            callback=checkpoint_callback,
+            log_interval=10,
+            progress_bar=True
+        )
 
 
 def main(

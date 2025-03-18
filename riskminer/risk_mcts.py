@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import torch as th
@@ -461,7 +462,7 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         self.env = self.env.envs[0] if hasattr(self.env, "envs") else self.env
         self.n_simulations = n_simulations
         self.c_param = c_param
-        self.gamma = gamma
+        self.gamma = gamma  # Discount factor
         self.num_timesteps = 0
         self.policy = None  # Not used in planning.
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu") if device is None else th.device(device)
@@ -493,19 +494,14 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         # Run MCTS simulations and record trajectories.
         for _ in range(self.n_simulations):
             node = root
-            # Selection & Expansion as before.
             while node.children and not node.done and node.is_fully_expanded(self):
                 node = node.best_child(self, self.c_param)
             if not node.done:
                 node = node.expand(self)
-            # Rollout phase now returns (reward, log_probs).
             rollout_reward, rollout_log_probs = node.rollout(self)
-            # Backpropagation.
             node.backpropagate(rollout_reward)
-            # Record the trajectory for policy update.
             trajectory = {"return": rollout_reward, "log_probs": rollout_log_probs}
             self.replay_buffer.append(trajectory)
-        # Choose best action from the root based on visits.
         best_action = None
         best_visits = -1
         for action, child in root.children.items():
@@ -530,19 +526,24 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         indicator_mean = np.mean([1 if R <= self.current_quantile else 0 for R in returns])
         self.current_quantile += beta * (1 - self.alpha - indicator_mean)
         # Log the loss to tensorboard
-        self.logger.record("train/loss", loss)
+        self.writer.add_scalar("train/loss", loss, self.num_timesteps)
 
     def learn(self,
-              total_timesteps: int,
-              callback: Optional[object] = None,
-              log_interval: int = 1,
-              tb_log_name: str = "run",
-              reset_num_timesteps: bool = True,
-              progress_bar: bool = False) -> "RiskMCTSAlgorithm":
-        self.num_timesteps = 0
+          total_timesteps: int,
+          callback: Optional[object] = None,
+          log_interval: int = 1,
+          reset_num_timesteps: bool = True,
+          progress_bar: bool = False) -> "RiskMCTSAlgorithm":
+        # Create or reuse a persistent SummaryWriter
+        if not hasattr(self, 'writer') and callback is not None:
+            # log_dir = f"./out/riskminer_tensorboard/{tb_log_name}"
+            self.writer = callback.writer #SummaryWriter(log_dir=log_dir)
+        
+        self.num_timesteps = self.num_timesteps  # Will use existing value if resuming
         iteration = 0
         if callback is not None:
-            self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            # self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            self._logger = callback.writer
             callback = self._init_callback(callback, progress_bar)
             callback.log_interval = log_interval
             callback.on_training_start(locals(), globals())
@@ -567,19 +568,18 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                 if log_interval is not None and iteration % log_interval == 0:
                     time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
                     fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
-                    self.logger.record("time/iterations", iteration, exclude="tensorboard")
-                    self.logger.record("time/fps", fps)
-                    self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
-                    self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
-                    self.logger.dump(step=self.num_timesteps)
+                    self.writer.add_scalar("time/iterations", iteration, self.num_timesteps)
+                    self.writer.add_scalar("time/fps", fps, self.num_timesteps)
+                    self.writer.add_scalar("time/time_elapsed", int(time_elapsed), self.num_timesteps)
+                    self.writer.add_scalar("time/total_timesteps", self.num_timesteps, self.num_timesteps)
+                    self.writer.flush()
                 iteration += 1
 
-            # Log the cumulative reward for the episode
-            self.logger.record("train/episode_reward", episode_reward)
+            # Log the cumulative reward for the episode.
+            self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)
             if callback is not None:
                 callback.update_locals(locals())
                 callback.on_rollout_end()
-            # Update risk policy (and log loss)
             self.update_risk_policy(beta=0.01)
         if callback is not None:
             callback.on_training_end()
@@ -590,23 +590,37 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         pass
 
     def save(self, path: Union[str, os.PathLike]) -> None:
-        config = {
+        # Ensure the path ends with the desired file extension, e.g., ".pt"
+        if not str(path).endswith(".pt"):
+            path = f"{path}.pt"
+        checkpoint = {
             "n_simulations": self.n_simulations,
             "c_param": self.c_param,
             "gamma": self.gamma,
             "num_timesteps": self.num_timesteps,
             "alpha": self.alpha,
             "current_quantile": self.current_quantile,
+            "risk_policy_state": self.risk_policy.state_dict(),
+            "risk_policy_optimizer_state": self.risk_policy.optimizer.state_dict(),
+            "replay_buffer": list(self.replay_buffer),
         }
-        with open(path, "w") as f:
-            json.dump(config, f)
-        print(f"Saved RiskMCTS configuration to {path}")
+        th.save(checkpoint, path)
+        print(f"Saved RiskMCTS checkpoint to {path}")
 
     @classmethod
     def load(cls, path: Union[str, os.PathLike], env: gym.Env, policy_net_kwargs: Dict[str, Any]) -> "RiskMCTSAlgorithm":
-        with open(path, "r") as f:
-            config = json.load(f)
-        instance = cls(env, policy_net_kwargs, config["n_simulations"], config["c_param"], alpha=config["alpha"], gamma=config["gamma"])
-        instance.num_timesteps = config.get("num_timesteps", 0)
-        instance.current_quantile = config.get("current_quantile", 0.0)
+        # Allow the global "numpy.core.multiarray.scalar" while loading.
+        with th.serialization.safe_globals(["numpy.core.multiarray.scalar"]):
+            checkpoint = th.load(path, weights_only=False)
+        instance = cls(env, policy_net_kwargs,
+                    n_simulations=checkpoint["n_simulations"],
+                    c_param=checkpoint["c_param"],
+                    alpha=checkpoint["alpha"],
+                    gamma=checkpoint["gamma"])
+        instance.num_timesteps = checkpoint.get("num_timesteps", 0)
+        instance.current_quantile = checkpoint.get("current_quantile", 0.0)
+        instance.risk_policy.load_state_dict(checkpoint["risk_policy_state"])
+        instance.risk_policy.optimizer.load_state_dict(checkpoint["risk_policy_optimizer_state"])
+        instance.replay_buffer = deque(checkpoint["replay_buffer"], maxlen=10000)
+        print(f"Loaded RiskMCTS checkpoint from {path}")
         return instance
