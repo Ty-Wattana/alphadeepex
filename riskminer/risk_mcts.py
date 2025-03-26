@@ -219,19 +219,28 @@ class MCTSAlgorithm(BaseAlgorithm):
               tb_log_name: str = "run",
               reset_num_timesteps: bool = True,
               progress_bar: bool = False) -> "MCTSAlgorithm":
+        
         self.num_timesteps = 0
         iteration = 0
+
+        # Create or reuse a persistent SummaryWriter
+        if not hasattr(self, 'writer') and callback is not None:
+            self.writer = callback.writer #SummaryWriter(log_dir=log_dir)
+        
         if callback is not None:
-            self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            # self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
+            self._logger = callback.writer
             callback = self._init_callback(callback, progress_bar)
             callback.on_training_start(locals(), globals())
 
         while self.num_timesteps < total_timesteps:
             obs = self.env.reset()
             done = False
+            episode_reward = 0.0  # accumulate reward per episode
             while not done and self.num_timesteps < total_timesteps:
                 action = self._plan_action()
                 obs, reward, done, truncated, info = self.env.step(action)
+                episode_reward += reward
                 self.num_timesteps += 1
                 if callback is not None and callback._on_step() is False:
                     callback.on_training_end()
@@ -241,15 +250,18 @@ class MCTSAlgorithm(BaseAlgorithm):
                 if log_interval is not None and iteration % log_interval == 0:
                     time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
                     fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
-                    self.logger.record("time/iterations", iteration, exclude="tensorboard")
+                    self.writer.add_scalar("time/iterations", iteration, exclude="tensorboard")
                     
-                    self.logger.record("time/fps", fps)
-                    self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
-                    self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
-                    self.logger.dump(step=self.num_timesteps)
+                    self.writer.add_scalar("time/fps", fps)
+                    self.writer.add_scalar("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+                    self.writer.add_scalar("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                    self.writer.flush()
+                iteration += 1
 
-            callback.update_locals(locals())
+            # Log the cumulative reward for the episode.
+            self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)
             if callback is not None:
+                callback.update_locals(locals())
                 callback.on_rollout_end()
         if callback is not None:
             callback.on_training_end()
@@ -534,13 +546,15 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
           log_interval: int = 1,
           reset_num_timesteps: bool = True,
           progress_bar: bool = False) -> "RiskMCTSAlgorithm":
-        # Create or reuse a persistent SummaryWriter
-        if not hasattr(self, 'writer') and callback is not None:
-            # log_dir = f"./out/riskminer_tensorboard/{tb_log_name}"
-            self.writer = callback.writer #SummaryWriter(log_dir=log_dir)
+        
         
         self.num_timesteps = self.num_timesteps  # Will use existing value if resuming
         iteration = 0
+
+        # Create or reuse a persistent SummaryWriter
+        if not hasattr(self, 'writer') and callback is not None:
+            self.writer = callback.writer #SummaryWriter(log_dir=log_dir)
+
         if callback is not None:
             # self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
             self._logger = callback.writer
