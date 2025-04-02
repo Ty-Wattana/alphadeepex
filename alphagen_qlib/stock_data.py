@@ -3,6 +3,7 @@ from enum import IntEnum
 import numpy as np
 import pandas as pd
 import torch
+from qlib.data import D
 
 
 class FeatureType(IntEnum):
@@ -180,3 +181,23 @@ class StockData:
         index = pd.MultiIndex.from_product([date_index, self._stock_ids])
         data = data.reshape(-1, n_columns)
         return pd.DataFrame(data.detach().cpu().numpy(), index=index, columns=columns)
+
+    def compute_oracle_scores(self) -> pd.DataFrame:
+        instruments = self.stock_ids.tolist()
+
+        # Query Qlib to get the closing price for each instrument.
+        # The field '$close' is used here (adjust if your field naming is different)
+        price_df:pd.DataFrame = D.features(
+            instruments=instruments,
+            fields=["$close"],
+            start_time=self._start_time,
+            end_time=self._end_time
+        )
+
+        price_df = price_df.reorder_levels(order=[1, 0])
+        price_unstacked = price_df.unstack(level=1)
+        # Compute daily percentage returns and shift so that prediction on day t 
+        # is compared with return from t to t+1
+        oracle_signal = price_unstacked.pct_change().shift(-1)
+        # Stack back to a MultiIndex DataFrame
+        return oracle_signal.stack()

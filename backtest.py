@@ -3,6 +3,7 @@ import os
 import pickle
 import warnings
 import pandas as pd
+import numpy as np
 import json
 from pathlib import Path
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from qlib.backtest import backtest, executor as exec
 from qlib.contrib.evaluate import risk_analysis
 from qlib.contrib.report.analysis_position import report_graph
 from qlib.contrib.strategy import TopkDropoutStrategy
+# from qlib.data import D
 
 from alphagen.data.expression import *
 from alphagen.data.parser import parse_expression
@@ -45,6 +47,37 @@ def dump_pickle(path: str,
         with open(path, "wb") as f:
             pickle.dump(obj, f)
         return obj
+def normalize_series(series: pd.Series) -> pd.Series:
+    return (series - series.mean()) / series.std()
+def compute_rmse_per_date(model_scores: pd.Series, oracle_scores: pd.Series) -> pd.DataFrame:
+    """
+    Compute the RMSE across stocks for each date.
+    
+    Parameters:
+      model_scores: pd.Series with MultiIndex (date, instrument) containing your model's prediction scores.
+      oracle_scores: pd.Series with MultiIndex (date, instrument) containing the oracle's prediction scores.
+      
+    Returns:
+      A DataFrame with the date as the index and a column 'rmse' containing the RMSE for that date.
+    """
+    # normalize
+    model_scores = normalize_series(model_scores)
+    oracle_scores = normalize_series(oracle_scores)
+
+    # Combine both series into one DataFrame
+    df = pd.DataFrame({
+        "model": model_scores,
+        "oracle": oracle_scores
+    })
+    # Group by the date level. If your MultiIndex doesn't have names,
+    # you can group by level=0 (assuming the first level is the date).
+    rmse_series = df.groupby(level=0).apply(
+        lambda group: np.sqrt(((group["oracle"] - group["model"]) ** 2).mean())
+    )
+    rmse_df = rmse_series.to_frame(name="rmse")
+    # Ensure the index is named "date" (or adjust as needed)
+    rmse_df.index.name = "date"
+    return rmse_df
 
 
 @dataclass
@@ -79,8 +112,16 @@ class QlibBacktest:
     def run(
         self,
         prediction: Union[pd.Series, pd.DataFrame],
+        oracle_signal:Optional[pd.DataFrame] = None,
         output_prefix: Optional[str] = None
     ) -> Tuple[pd.DataFrame, BacktestResult]:
+        
+        # calculate RMSE
+        if oracle_signal is not None:
+            rmse_df = compute_rmse_per_date(prediction.iloc[:,0], oracle_signal.iloc[:,0])
+
+            dump_pickle(output_prefix + "-rmse.pkl", lambda: rmse_df, True)
+
         prediction = prediction.sort_index()
         index: pd.MultiIndex = prediction.index.remove_unused_levels()  # type: ignore
         dates = index.levels[0]
@@ -159,7 +200,8 @@ if __name__ == "__main__":
 
     def run_backtest(prefix: str, seed: int, exprs: List[Expression], weights: List[float]):
         df = data.make_dataframe(calc.make_ensemble_alpha(exprs, weights))
-        qlib_backtest.run(df, output_prefix=f"out/backtests/51-5/{prefix}/{seed}")
+        oracle_signal = data.compute_oracle_scores()
+        qlib_backtest.run(df,oracle_signal=oracle_signal, output_prefix=f"out/backtests/51-5/{prefix}/{seed}")
 
     for p in Path("out/gp").iterdir():
         seed = int(p.name)
@@ -186,6 +228,11 @@ if __name__ == "__main__":
         except:
             continue
         run_backtest(ver, seed, exprs, weights)
+
+    # oracle back test
+
+    oracle_signal = data.compute_oracle_scores()
+    qlib_backtest.run(oracle_signal, output_prefix=f"out/backtests/51-5/oracle/0")
     exit(0)
     for p in Path("out/llm-tests/interaction").iterdir():
         if not p.name.startswith("v1"):
