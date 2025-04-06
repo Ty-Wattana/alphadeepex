@@ -461,7 +461,7 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
     def __init__(self, 
                  env: gym.Env,
                  policy_net_kwargs: Dict[str, Any],
-                 n_simulations: int = 10,
+                 n_simulations: int = 200,
                  c_param: float = 1.41,
                  alpha: float = 0.7,
                  replay_size: int = 10000,
@@ -573,7 +573,6 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                 action = self._plan_action()
                 obs, reward, done, truncated, info = self.env.step(action)
                 episode_reward += reward
-                self.num_timesteps += 1
 
                 if callback is not None and callback._on_step() is False:
                     callback.on_training_end()
@@ -588,6 +587,8 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                     self.writer.add_scalar("time/total_timesteps", self.num_timesteps, self.num_timesteps)
                     self.writer.flush()
                 iteration += 1
+            
+            self.num_timesteps += 1
 
             # Log the cumulative reward for the episode.
             self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)

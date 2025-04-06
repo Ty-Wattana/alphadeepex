@@ -64,7 +64,7 @@ class AlphaDenseEnv(AlphaEnvCore):
     Add MCST methods
     """
 
-    def _inter_reward(self, lamda: float = 0.5) -> float:
+    def _inter_reward(self, lamda: float = 0.1) -> float:
         expr: Expression = self._builder.get_tree()
         try:
             ic_ret, ic_mut = self.pool._calc_ics(expr, ic_mut_threshold=0.99)

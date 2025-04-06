@@ -337,7 +337,7 @@ def run_single_experiment(
     policy_net_kwargs = {
         "input_dim": env.observation_space.shape[0],  # dimension of observation
         "hidden_dim": 64,                              # GRU hidden dimension
-        "num_layers": 1,                               # number of GRU layers
+        "num_layers": 4,                               # number of GRU layers
         "action_dim": env.action_space.n,              # number of actions
         "mlp_hidden_sizes": [32, 32],                  # MLP hidden layers
         "lr": 0.001                                    # learning rate
@@ -348,8 +348,8 @@ def run_single_experiment(
     Resume training or new.
     """
 
-    resume = False
-    # resume = True
+    # resume = False
+    resume = True
 
     if resume:
 
