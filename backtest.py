@@ -49,6 +49,13 @@ def dump_pickle(path: str,
         return obj
 def normalize_series(series: pd.Series) -> pd.Series:
     return (series - series.mean()) / series.std()
+
+def rank_series_per_date(series: pd.Series) -> pd.Series:
+    """
+    Rank the series for each date (assumed to be the first level of the MultiIndex).
+    The highest value is assigned rank 1.
+    """
+    return series.groupby(level=0).rank(ascending=False, method='min')
 def compute_rmse_per_date(model_scores: pd.Series, oracle_scores: pd.Series) -> pd.DataFrame:
     """
     Compute the RMSE across stocks for each date.
@@ -61,8 +68,12 @@ def compute_rmse_per_date(model_scores: pd.Series, oracle_scores: pd.Series) -> 
       A DataFrame with the date as the index and a column 'rmse' containing the RMSE for that date.
     """
     # normalize
-    model_scores = normalize_series(model_scores)
-    oracle_scores = normalize_series(oracle_scores)
+    # model_scores = normalize_series(model_scores)
+    # oracle_scores = normalize_series(oracle_scores)
+
+    # rank the scores
+    model_scores = rank_series_per_date(model_scores)
+    oracle_scores = rank_series_per_date(oracle_scores)
 
     # Combine both series into one DataFrame
     df = pd.DataFrame({
