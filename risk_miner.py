@@ -348,8 +348,8 @@ def run_single_experiment(
     Resume training or new.
     """
 
-    resume = False
-    # resume = True
+    # resume = False
+    resume = True
 
     if resume:
 
