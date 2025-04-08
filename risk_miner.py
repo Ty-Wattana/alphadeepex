@@ -348,8 +348,8 @@ def run_single_experiment(
     Resume training or new.
     """
 
-    # resume = False
-    resume = True
+    resume = False
+    # resume = True
 
     if resume:
 
@@ -430,10 +430,10 @@ def run_single_experiment(
         model = RiskMCTSAlgorithm(
             env=env,
             policy_net_kwargs=policy_net_kwargs,
-            n_simulations=10,   # number of MCTS simulations per planning step
+            n_simulations=20,   # number of MCTS simulations per planning step
             c_param=1.41,
             alpha=0.7,          # risk-seeking quantile level
-            replay_size=1000,   # smaller replay size for demo purposes
+            replay_size=10000,   # smaller replay size for demo purposes
             batch_size=128,
             tensorboard_log="./out/riskminer_tensorboard",
             gamma=1.0

@@ -28,11 +28,19 @@ from alphagen.config import MAX_EXPR_LENGTH
 # --- Helper: dynamic valid actions ---
 
 def clone_env_state(env: Any) -> Any:
-    # Here we assume env.get_state() returns a deep-copyable object
+    # If the environment stores its state in a NumPy array attribute '_state'
+    if hasattr(env, '_state'):
+        # Use np.copy which is optimized in C
+        return np.copy(env._state)
+    # Otherwise fall back to using the provided get_state() method.
     return env.get_state()
 
 def restore_env_state(env: Any, state: Any) -> None:
-    env.set_state(state)
+    if hasattr(env, '_state'):
+        # If possible, update the state's content in-place.
+        env._state[:] = state
+    else:
+        env.set_state(state)
 
 
 def get_legal_actions(obs: Any, action_mask: Optional[List[bool]], action_space: spaces.Space) -> List[int]:
@@ -392,7 +400,6 @@ class RiskMCTSNode:
             current_obs = new_obs
         return total_reward, log_probs
 
-# --- Risk-Seeking Policy Network with Policy Gradient Update ---
 
 class RiskSeekerPolicy(nn.Module):
     def __init__(self, 
@@ -404,10 +411,8 @@ class RiskSeekerPolicy(nn.Module):
                  lr: float = 0.001,
                  device: Optional[str] = None):
         super(RiskSeekerPolicy, self).__init__()
-        # Determine device: use GPU if available, otherwise CPU.
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu") if device is None else th.device(device)
         
-        # GRU layer expects input of shape (batch, seq_len, input_dim)
         self.gru = nn.GRU(input_size=input_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True).to(self.device)
         
         mlp_input_dim = hidden_dim
@@ -431,22 +436,32 @@ class RiskSeekerPolicy(nn.Module):
         return logits
 
     def get_prior(self, observation: Any) -> List[float]:
-        # If observation is a 1D array, reshape it to (1, 1, input_dim)
+        # For a single observation.
         if isinstance(observation, np.ndarray) and observation.ndim == 1:
             observation = observation.reshape(1, 1, -1)
-        # Create tensor on the correct device.
         x = th.tensor(observation, dtype=th.float32, device=self.device)
         logits = self.forward(x)
-        # Compute softmax to get a probability distribution over actions.
         prior = th.softmax(logits, dim=-1).detach().cpu().numpy()[0]
         return prior.tolist()
+
+    def get_prior_batch(self, observations: np.ndarray) -> List[List[float]]:
+        """
+        Process a batch of observations.
+        observations should be an np.ndarray of shape (batch_size, input_dim)
+        or (batch_size, seq_len, input_dim). If a 2D array is passed, it is reshaped.
+        """
+        if observations.ndim == 2:
+            observations = observations[:, None, :]
+        x = th.tensor(observations, dtype=th.float32, device=self.device)
+        logits = self.forward(x)
+        priors = th.softmax(logits, dim=-1).detach().cpu().numpy()
+        return priors.tolist()
 
     def update_policy(self, trajectories: List[Dict[str, Any]], quantile: float, beta: float) -> float:
         loss = th.tensor(0.0, dtype=th.float32, requires_grad=True, device=self.device)
         for traj in trajectories:
             R = traj["return"]
             indicator = 1.0 if R <= quantile else 0.0
-            # Convert list of log_probs to tensor.
             log_probs = th.tensor(traj["log_probs"], dtype=th.float32, device=self.device)
             loss = loss + (-indicator * log_probs.sum())
         loss = loss / len(trajectories)
@@ -455,7 +470,6 @@ class RiskSeekerPolicy(nn.Module):
         self.optimizer.step()
         return loss.item()
 
-# --- Risk-Seeking MCTS Algorithm Integrating Policy Gradients ---
 
 class RiskMCTSAlgorithm(BaseAlgorithm):
     def __init__(self, 
@@ -469,8 +483,8 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
                  gamma: float = 1.0,
                  device: Optional[str] = None,
                  **kwargs):
-        # Use a dummy policy to satisfy BaseAlgorithm.
         super().__init__(policy=MlpPolicy, env=env, learning_rate=0.0, **kwargs)
+        # If using a vectorized environment, we assume env.envs is available.
         self.env = self.env.envs[0] if hasattr(self.env, "envs") else self.env
         self.n_simulations = n_simulations
         self.c_param = c_param
@@ -478,7 +492,6 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         self.num_timesteps = 0
         self.policy = None  # Not used in planning.
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu") if device is None else th.device(device)
-        # Ensure the policy network gets the device information.
         policy_net_kwargs["device"] = str(self.device)
         self.risk_policy = RiskSeekerPolicy(**policy_net_kwargs)
         self.replay_buffer = deque(maxlen=replay_size)
@@ -497,13 +510,13 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         return new_state, obs, reward, done or truncated, info
 
     def _plan_action(self) -> int:
+        # Single-environment planning (kept for backward compatibility)
         state = clone_env_state(self.env)
         obs = self.env.get_obs() if hasattr(self.env, "get_obs") else self.env.reset()[0]
         mask = self.env.action_masks() if hasattr(self.env, "action_masks") else None
         if isinstance(obs, dict):
             obs["action_mask"] = mask
         root = RiskMCTSNode(state, obs, action_mask=mask, prior=0.0)
-        # Run MCTS simulations and record trajectories.
         for _ in range(self.n_simulations):
             node = root
             while node.children and not node.done and node.is_fully_expanded(self):
@@ -525,6 +538,202 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
             best_action = random.choice(legal) if legal else 0
         return best_action
 
+    def rollout_batch(self, nodes: List[RiskMCTSNode], max_depth: int = MAX_EXPR_LENGTH) -> Tuple[List[float], List[List[float]]]:
+        """
+        Processes a batch of rollout trajectories concurrently.
+        For nodes that are not done, we accumulate their observations,
+        use get_prior_batch to compute risk priors in one forward pass,
+        then update each node in the batch.
+        """
+        # Prepare per–node rollout data
+        num_nodes = len(nodes)
+        # Save per rollout data in lists: one entry per node.
+        total_rewards = [0.0] * num_nodes
+        log_probs_batch = [[] for _ in range(num_nodes)]
+        # Current state/observation for each rollout.
+        current_states = [node.env_state for node in nodes]
+        current_obs = [node.obs for node in nodes]
+        done_flags = [False] * num_nodes
+
+        depth = 0
+        discount = self.gamma
+
+        while depth < max_depth and not all(done_flags):
+            # Identify indices of nodes that are still active.
+            active_indices = [i for i, done in enumerate(done_flags) if not done]
+            if not active_indices:
+                break
+
+            # Gather the observations for the active rollouts.
+            batch_obs = []
+            active_map = {}  # Map from batch index to node index.
+            for bi, i in enumerate(active_indices):
+                # Ensure the observation is in array format.
+                obs_i = current_obs[i]
+                if isinstance(obs_i, dict):
+                    # If observation is a dict, assume the key "obs" holds the numerical data.
+                    obs_i = obs_i.get("obs", obs_i)
+                batch_obs.append(np.array(obs_i))
+                active_map[bi] = i
+
+            # Call risk policy in batch.
+            priors = self.risk_policy.get_prior_batch(np.array(batch_obs))  # shape: (batch_size, action_dim)
+            
+            # For each active rollout, select an action and simulate one step.
+            for bi, i in active_map.items():
+                # Get legal actions for current state; you could also include masks if available.
+                legal = get_legal_actions(current_obs[i], None, self.env.action_space)
+                if not legal:
+                    done_flags[i] = True
+                    continue
+
+                # Extract the prior probabilities for the current rollout.
+                prior_probs = np.array([priors[bi][a] for a in legal])
+                if prior_probs.sum() == 0:
+                    prior_probs = np.ones_like(prior_probs)
+                prior_probs /= prior_probs.sum()
+
+                action = np.random.choice(legal, p=prior_probs)
+                log_prob = np.log(prior_probs[legal.index(action)])
+                log_probs_batch[i].append(log_prob)
+
+                # Simulate the chosen action.
+                new_state, new_obs, reward, done, info = self.simulate_action(current_states[i], action)
+                total_rewards[i] += (discount ** depth) * reward
+
+                if done:
+                    done_flags[i] = True
+                else:
+                    current_states[i] = new_state
+                    current_obs[i] = new_obs
+            depth += 1
+
+        return total_rewards, log_probs_batch
+
+    def _plan_actions_batch(self, observations: List[Any], states: List[Any], masks: List[Any]) -> List[int]:
+        """
+        Given a batch of observations, states, and action masks,
+        builds an independent MCTS tree per environment.
+        For each simulation in a tree, we accumulate rollout nodes in a list
+        and use rollout_batch to process them concurrently.
+        """
+        actions = []
+        for obs, state, mask in zip(observations, states, masks):
+            root = RiskMCTSNode(state, obs, action_mask=mask, prior=0.0)
+            simulation_nodes = []
+            # Run n_simulations for this environment.
+            for _ in range(self.n_simulations):
+                node = root
+                # Traverse down the tree until a leaf is found.
+                while node.children and not node.done and node.is_fully_expanded(self):
+                    node = node.best_child(self, self.c_param)
+                if not node.done:
+                    node = node.expand(self)
+                simulation_nodes.append(node)
+            # Process all simulations at once using batched rollout.
+            rewards, log_probs_batch = self.rollout_batch(simulation_nodes)
+            # Backpropagate the rollout rewards for each simulation.
+            for node, reward, log_probs in zip(simulation_nodes, rewards, log_probs_batch):
+                node.backpropagate(reward)
+                trajectory = {"return": reward, "log_probs": log_probs}
+                self.replay_buffer.append(trajectory)
+            # Choose the action from the root with the highest visit count.
+            best_action = None
+            best_visits = -1
+            for action_key, child in root.children.items():
+                if child.visits > best_visits:
+                    best_visits = child.visits
+                    best_action = action_key
+            if best_action is None:
+                legal = get_legal_actions(obs, mask, self.env.action_space)
+                best_action = random.choice(legal) if legal else 0
+            actions.append(best_action)
+        return actions
+
+    def learn(self,
+              total_timesteps: int,
+              callback: Optional[object] = None,
+              log_interval: int = 1,
+              reset_num_timesteps: bool = True,
+              progress_bar: bool = False) -> "RiskMCTSAlgorithm":
+        self.num_timesteps = self.num_timesteps  # resume if needed
+        iteration = 0
+
+        if not hasattr(self, 'writer') and callback is not None:
+            self.writer = callback.writer
+
+        if callback is not None:
+            self._logger = callback.writer
+            callback = self._init_callback(callback, progress_bar)
+            callback.log_interval = log_interval
+            callback.on_training_start(locals(), globals())
+
+        self.start_time = time.time_ns()
+        self._num_timesteps_at_start = self.num_timesteps
+
+        # If using a vectorized environment, assume self.env has an "envs" attribute.
+        if hasattr(self.env, "envs"):
+            vec_env = self.env
+            observations = vec_env.reset()
+            states = [clone_env_state(env) for env in vec_env.envs]
+            masks = [env.action_masks() for env in vec_env.envs]
+            while self.num_timesteps < total_timesteps:
+                # Use batched planning with the new rollout_batch.
+                actions = self._plan_actions_batch(observations, states, masks)
+                observations, rewards, dones, truncated, infos = vec_env.step(actions)
+                episode_reward = np.sum(rewards)
+                self.num_timesteps += 1
+
+                if callback is not None and callback._on_step() is False:
+                    callback.on_training_end()
+                    return self
+
+                if iteration % log_interval == 0:
+                    time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                    fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                    self.writer.add_scalar("time/iterations", iteration, self.num_timesteps)
+                    self.writer.add_scalar("time/fps", fps, self.num_timesteps)
+                    self.writer.add_scalar("time/time_elapsed", int(time_elapsed), self.num_timesteps)
+                    self.writer.add_scalar("time/total_timesteps", self.num_timesteps, self.num_timesteps)
+                    self.writer.flush()
+                iteration += 1
+                self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)
+                if callback is not None:
+                    callback.update_locals(locals())
+                    callback.on_rollout_end()
+                self.update_risk_policy(beta=0.01)
+        else:
+            # Single environment fallback.
+            while self.num_timesteps < total_timesteps:
+                obs = self.env.reset()
+                done = False
+                episode_reward = 0.0
+                while not done and self.num_timesteps < total_timesteps:
+                    action = self._plan_action()
+                    obs, reward, done, truncated, info = self.env.step(action)
+                    episode_reward += reward
+                    if callback is not None and callback._on_step() is False:
+                        callback.on_training_end()
+                        return self
+                    if iteration % log_interval == 0:
+                        time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                        fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                        self.writer.add_scalar("time/iterations", iteration, self.num_timesteps)
+                        self.writer.add_scalar("time/fps", fps, self.num_timesteps)
+                        self.writer.add_scalar("time/time_elapsed", int(time_elapsed), self.num_timesteps)
+                        self.writer.add_scalar("time/total_timesteps", self.num_timesteps, self.num_timesteps)
+                        self.writer.flush()
+                    iteration += 1
+                self.num_timesteps += 1
+                self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)
+                if callback is not None:
+                    callback.update_locals(locals())
+                    callback.on_rollout_end()
+                self.update_risk_policy(beta=0.01)
+        if callback is not None:
+            callback.on_training_end()
+        return self
+
     def predict(self, observation: Any, deterministic: bool = True) -> Tuple[np.ndarray, None]:
         action = self._plan_action()
         return np.array([action]), None
@@ -537,75 +746,12 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
         returns = [traj["return"] for traj in trajectories]
         indicator_mean = np.mean([1 if R <= self.current_quantile else 0 for R in returns])
         self.current_quantile += beta * (1 - self.alpha - indicator_mean)
-        # Log the loss to tensorboard
         self.writer.add_scalar("train/loss", loss, self.num_timesteps)
 
-    def learn(self,
-          total_timesteps: int,
-          callback: Optional[object] = None,
-          log_interval: int = 1,
-          reset_num_timesteps: bool = True,
-          progress_bar: bool = False) -> "RiskMCTSAlgorithm":
-        
-        
-        self.num_timesteps = self.num_timesteps  # Will use existing value if resuming
-        iteration = 0
-
-        # Create or reuse a persistent SummaryWriter
-        if not hasattr(self, 'writer') and callback is not None:
-            self.writer = callback.writer #SummaryWriter(log_dir=log_dir)
-
-        if callback is not None:
-            # self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
-            self._logger = callback.writer
-            callback = self._init_callback(callback, progress_bar)
-            callback.log_interval = log_interval
-            callback.on_training_start(locals(), globals())
-
-        self.start_time = time.time_ns()
-        self._num_timesteps_at_start = self.num_timesteps
-
-        while self.num_timesteps < total_timesteps:
-            obs = self.env.reset()
-            done = False
-            episode_reward = 0.0  # accumulate reward per episode
-            while not done and self.num_timesteps < total_timesteps:
-                action = self._plan_action()
-                obs, reward, done, truncated, info = self.env.step(action)
-                episode_reward += reward
-
-                if callback is not None and callback._on_step() is False:
-                    callback.on_training_end()
-                    return self
-
-                if log_interval is not None and iteration % log_interval == 0:
-                    time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
-                    fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
-                    self.writer.add_scalar("time/iterations", iteration, self.num_timesteps)
-                    self.writer.add_scalar("time/fps", fps, self.num_timesteps)
-                    self.writer.add_scalar("time/time_elapsed", int(time_elapsed), self.num_timesteps)
-                    self.writer.add_scalar("time/total_timesteps", self.num_timesteps, self.num_timesteps)
-                    self.writer.flush()
-                iteration += 1
-            
-            self.num_timesteps += 1
-
-            # Log the cumulative reward for the episode.
-            self.writer.add_scalar("train/episode_reward", episode_reward, self.num_timesteps)
-            if callback is not None:
-                callback.update_locals(locals())
-                callback.on_rollout_end()
-            self.update_risk_policy(beta=0.01)
-        if callback is not None:
-            callback.on_training_end()
-        return self
-
     def train(self, gradient_steps: int, batch_size: int) -> None:
-        # RiskMCTSAlgorithm does not use typical gradient steps during planning.
         pass
 
     def save(self, path: Union[str, os.PathLike]) -> None:
-        # Ensure the path ends with the desired file extension, e.g., ".pt"
         if not str(path).endswith(".pt"):
             path = f"{path}.pt"
         checkpoint = {
@@ -624,7 +770,6 @@ class RiskMCTSAlgorithm(BaseAlgorithm):
 
     @classmethod
     def load(cls, path: Union[str, os.PathLike], env: gym.Env, policy_net_kwargs: Dict[str, Any]) -> "RiskMCTSAlgorithm":
-        # Allow the global "numpy.core.multiarray.scalar" while loading.
         with th.serialization.safe_globals(["numpy.core.multiarray.scalar"]):
             checkpoint = th.load(path, weights_only=False)
         instance = cls(env, policy_net_kwargs,
