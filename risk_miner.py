@@ -337,7 +337,7 @@ def run_single_experiment(
     policy_net_kwargs = {
         "input_dim": env.observation_space.shape[0],  # dimension of observation
         "hidden_dim": 64,                              # GRU hidden dimension
-        "num_layers": 1,                               # number of GRU layers
+        "num_layers": 4,                               # number of GRU layers
         "action_dim": env.action_space.n,              # number of actions
         "mlp_hidden_sizes": [32, 32],                  # MLP hidden layers
         "lr": 0.001                                    # learning rate
@@ -430,10 +430,10 @@ def run_single_experiment(
         model = RiskMCTSAlgorithm(
             env=env,
             policy_net_kwargs=policy_net_kwargs,
-            n_simulations=10,   # number of MCTS simulations per planning step
+            n_simulations=20,   # number of MCTS simulations per planning step
             c_param=1.41,
             alpha=0.7,          # risk-seeking quantile level
-            replay_size=1000,   # smaller replay size for demo purposes
+            replay_size=10000,   # smaller replay size for demo purposes
             batch_size=128,
             tensorboard_log="./out/riskminer_tensorboard",
             gamma=1.0
