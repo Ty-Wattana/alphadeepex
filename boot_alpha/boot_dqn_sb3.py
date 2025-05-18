@@ -189,16 +189,80 @@ class BootstrappedDQN(DQN):
                           self.target_q_networks[i].parameters(),
                           self.tau)
 
-    def predict(self, observation, hidden=None, use_ensemble=False):
-        # If observation is dict (as in HER), extract the "observation" component.
+    # def predict(self, observation, hidden=None, use_ensemble=False):
+    #     # If observation is dict (as in HER), extract the "observation" component.
+    #     if isinstance(observation, dict):
+    #         obs_tensor = torch.tensor(observation["observation"], dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
+    #     elif isinstance(observation, (list, np.ndarray)):
+    #         obs_tensor = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
+    #         if obs_tensor.dim() == 1:
+    #             obs_tensor = obs_tensor.unsqueeze(0)
+    #     else:
+    #         obs_tensor = observation.to(self.device)
+
+    #     with torch.no_grad():
+    #         if use_ensemble:
+    #             qs = []
+    #             for net in self.q_networks:
+    #                 q, hidden_out = net(obs_tensor, hidden)
+    #                 qs.append(q)
+    #             q_values = torch.stack(qs, dim=0).mean(dim=0)
+    #         else:
+    #             q_values, hidden_out = self.q_networks[self.current_head](obs_tensor, hidden)
+    #     raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
+    #     mask = adjust_action_mask(raw_mask, q_values.shape)
+    #     q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))
+    #     action = torch.argmax(q_values, dim=1).cpu().numpy()
+    #     return action, hidden_out
+
+    def predict(self, observation, state=None, episode_start=None, deterministic=False,use_ensemble=False):
+        """
+        SB3-compatible predict signature, with correct action masking env:
+          - observation: current observation
+          - state: hidden state
+          - episode_start: flag for new episodes
+          - deterministic: use ensemble if True
+        """
+        # Reset hidden state at episode start if provided
+        if episode_start is not None:
+            state = None
+        # Determine which environment to use for masking (eval_env if present)
+        mask_env = getattr(self, "mask_env", self.env)
+        # Delegate to internal prediction logic, passing mask_env
+        return self._predict_internal(
+            observation,
+            hidden=state,
+            use_ensemble=deterministic,
+            mask_env=mask_env
+        )
+        # """
+        # SB3-compatible predict signature:
+        #   - observation: current observation
+        #   - state: hidden state
+        #   - episode_start: mask or flag indicating new episode(s)
+        #   - deterministic: whether to use ensemble or single head
+        # Returns:
+        #   actions (np.ndarray), new_hidden_state
+        # """
+        # # Reset hidden state at episode start if provided
+        # if episode_start is not None:
+        #     # If episode_start is a boolean array, reset state where True
+        #     # Here we simply drop old state to reinitialize in internal method
+        #     state = None
+        # # Delegate to internal prediction logic
+        # return self._predict_internal(
+        #     observation, hidden=state, use_ensemble=deterministic
+        # )
+
+    def _predict_internal(self, observation, hidden=None, use_ensemble=False, mask_env=None):
+        # Extract raw observation
         if isinstance(observation, dict):
-            obs_tensor = torch.tensor(observation["observation"], dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
-        elif isinstance(observation, (list, np.ndarray)):
-            obs_tensor = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
+            obs_raw = observation["observation"]
         else:
-            obs_tensor = observation.to(self.device)
+            obs_raw = observation
+
+        # Convert to tensor on device
+        obs_tensor = self.policy.obs_to_tensor(obs_raw)[0]
 
         with torch.no_grad():
             if use_ensemble:
@@ -209,10 +273,13 @@ class BootstrappedDQN(DQN):
                 q_values = torch.stack(qs, dim=0).mean(dim=0)
             else:
                 q_values, hidden_out = self.q_networks[self.current_head](obs_tensor, hidden)
-        raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
+
+        # Apply action mask
+        raw_mask = torch.as_tensor(get_action_masks(mask_env)).to(self.device)
         mask = adjust_action_mask(raw_mask, q_values.shape)
-        q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))
+        q_values = torch.where(mask, q_values, torch.tensor(-float('inf'), device=self.device))
         action = torch.argmax(q_values, dim=1).cpu().numpy()
+
         return action, hidden_out
 
     def _sample_action(self, learning_starts: int, action_noise=None, n_envs: int = 1):
