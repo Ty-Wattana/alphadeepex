@@ -7,7 +7,7 @@ from pathlib import Path
 from openai import OpenAI
 
 import numpy as np
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from torch.utils.tensorboard import SummaryWriter
 
 from alphagen.data.expression import *
@@ -30,6 +30,8 @@ import numpy as np
 from typing import List, Optional
 from typing import TypeVar
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
+from stable_baselines3.common.vec_env import sync_envs_normalization
+from stable_baselines3.common.evaluation import evaluate_policy
 
 from boot_alpha.reward_dense_env import AlphaEnvDense
 
@@ -237,6 +239,146 @@ class CustomCallback(BaseCallback):
         else:
             return self.training_env.unwrapped
 
+        
+class ModifiedEvalCallback(EvalCallback, BaseCallback):
+    """
+    Combines EvalCallback logic with CustomCallback's logging, pool management,
+    and LLM invocation on MCTS training. Periodically evaluates the policy on eval_env.
+    """
+    def __init__(
+        self,
+        eval_env,
+        save_path: str,
+        test_calculators: List[Any],
+        n_eval_episodes: int = 5,
+        eval_freq: int = 100,
+        chat_session: Optional[Any] = None,
+        llm_every_n_steps: int = 25000,
+        tb_log_name: str = "e_miner_tensorboard",
+        drop_rl_n: int = 5,
+        verbose: int = 1
+    ):
+        EvalCallback.__init__(
+            self,
+            eval_env=eval_env,
+            callback_on_new_best=None,
+            best_model_save_path=save_path,
+            log_path=None,
+            n_eval_episodes=n_eval_episodes,
+            eval_freq=eval_freq,
+            verbose=verbose
+        )
+        BaseCallback.__init__(self, verbose=verbose)
+
+        # CustomCallback state
+        self.save_path = save_path
+        os.makedirs(self.save_path, exist_ok=True)
+        self.test_calculators = test_calculators
+
+        # Tensorboard
+        self.tb_log_name = tb_log_name
+        log_dir = f"./out/e_miner_tensorboard/{tb_log_name}"
+        self.writer = SummaryWriter(log_dir=log_dir)
+
+        # LLM scheduling
+        self.chat_session = chat_session
+        self.llm_every_n_steps = llm_every_n_steps
+        self.llm_use_count = 0
+        self.last_llm_use = 0
+        self._drop_rl_n = drop_rl_n
+    
+    def _on_step(self) -> bool:
+        # Only run evaluation every eval_freq calls
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            # Sync normalization if needed
+            if self.model.get_vec_normalize_env() is not None:
+                try:
+                    sync_envs_normalization(self.training_env, self.eval_env)
+                except Exception:
+                    pass
+
+            # --- Evaluate on validation env ---
+            self.model.eval_env = self.eval_env
+            ep_rews, ep_lens = evaluate_policy(
+                self.model,
+                self.eval_env,
+                n_eval_episodes=self.n_eval_episodes,
+                render=self.render,
+                deterministic=self.deterministic,
+                return_episode_rewards=True,
+                warn=self.warn
+            )
+            del self.model.eval_env
+            mean_reward = float(np.mean(ep_rews))
+            mean_length = float(np.mean(ep_lens))
+            self.writer.add_scalar("validation/mean_reward", mean_reward, self.num_timesteps)
+            self.writer.add_scalar("validation/mean_ep_length", mean_length, self.num_timesteps)
+
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # Custom logging and LLM logic
+        if self.chat_session is not None:
+            self._try_use_llm()
+
+        pool = self.pool
+        self.writer.add_scalar('pool/size', pool.size, self.num_timesteps)
+        self.writer.add_scalar('pool/significant', np.sum(np.abs(pool.weights[:pool.size]) > 1e-4), self.num_timesteps)
+        self.writer.add_scalar('pool/best_ic_ret', pool.best_ic_ret, self.num_timesteps)
+        self.writer.add_scalar('pool/eval_cnt', pool.eval_cnt, self.num_timesteps)
+        self.writer.add_scalar('pool/expr_len', len(self.env_core._tokens), self.num_timesteps)
+
+        n_days = sum(calc.data.n_days for calc in self.test_calculators)
+        ic_mean, rank_ic_mean = 0.0, 0.0
+        for i, calc in enumerate(self.test_calculators, start=1):
+            ic, rank_ic = pool.test_ensemble(calc)
+            weight = calc.data.n_days / n_days
+            ic_mean += ic * weight
+            rank_ic_mean += rank_ic * weight
+            self.writer.add_scalar(f'test/ic_{i}', ic, self.num_timesteps)
+            self.writer.add_scalar(f'test/rank_ic_{i}', rank_ic, self.num_timesteps)
+        self.writer.add_scalar('test/ic_mean', ic_mean, self.num_timesteps)
+        self.writer.add_scalar('test/rank_ic_mean', rank_ic_mean, self.num_timesteps)
+
+        # Save checkpoints
+        self.save_checkpoint()
+
+        # Now run EvalCallback's rollout end (to log eval metrics)
+        super(EvalCallback, self)._on_rollout_end()
+
+    def save_checkpoint(self):
+        path = os.path.join(self.save_path, f'{self.num_timesteps}_steps')
+        self.model.save(path)   # type: ignore
+        if self.verbose > 1:
+            print(f'Saving model checkpoint to {path}')
+        with open(f'{path}_pool.json', 'w') as f:
+            json.dump(self.pool.to_json_dict(), f)
+
+    def _try_use_llm(self):
+        if self.num_timesteps - self.last_llm_use < self.llm_every_n_steps:
+            return
+        self.last_llm_use = self.num_timesteps
+        self.llm_use_count += 1
+        sess = self.chat_session
+        sess.client.reset()
+        sess.logger.debug(f"[Step {self.num_timesteps}] LLM invocation #{self.llm_use_count}: best_ic={self.pool.best_ic_ret:.4f}")
+        try:
+            remain_n = max(0, self.pool.size - self._drop_rl_n)
+            remain = self.pool.most_significant_indices(remain_n)
+            self.pool.leave_only(remain)
+            self.chat_session.update_pool(self.pool)
+        except Exception as e:
+            sess.logger.warning(f"LLM invocation failed: {e}")
+
+    @property
+    def pool(self):
+        return self.env_core.pool
+
+    @property
+    def env_core(self):
+        return (self.training_env.envs[0].unwrapped
+                if hasattr(self.training_env, 'envs') else
+                self.training_env.unwrapped)
 
 def run_single_experiment(
     seed: int = 0,
@@ -364,7 +506,35 @@ def run_single_experiment(
         name_prefix = os.listdir('out/e_miner_tensorboard')[-1]
         save_path = f'./out/e_miner/{latest_subdir}'
 
-        checkpoint_callback = CustomCallback(
+        # checkpoint_callback = CustomCallback(
+        #     save_path=save_path,
+        #     test_calculators=calculators[1:],
+        #     verbose=1,
+        #     chat_session=inter,
+        #     llm_every_n_steps=llm_every_n_steps,
+        #     drop_rl_n=drop_rl_n,
+        #     tb_log_name=name_prefix
+        # )
+
+        eval_pool = MseAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[1],
+            ic_lower_bound=None,
+            l1_alpha=5e-3,
+            device=device
+        )
+
+        eval_env = AlphaEnvDense(
+            pool=eval_pool,
+            device=device,
+            print_expr=True,
+            # constrain = True,
+            # penalty = True,
+            # her = True
+        )
+
+        checkpoint_callback = ModifiedEvalCallback(
+            eval_env=eval_env,
             save_path=save_path,
             test_calculators=calculators[1:],
             verbose=1,
@@ -411,7 +581,35 @@ def run_single_experiment(
         #             tb_log_name=name_prefix
         #             )
 
-        checkpoint_callback = CustomCallback(
+        # checkpoint_callback = CustomCallback(
+        #     save_path=save_path,
+        #     test_calculators=calculators[1:],
+        #     verbose=1,
+        #     chat_session=inter,
+        #     llm_every_n_steps=llm_every_n_steps,
+        #     drop_rl_n=drop_rl_n,
+        #     tb_log_name=name_prefix
+        # )
+
+        eval_pool = MseAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[1],
+            ic_lower_bound=None,
+            l1_alpha=5e-3,
+            device=device
+        )
+
+        eval_env = AlphaEnvDense(
+            pool=eval_pool,
+            device=device,
+            print_expr=True,
+            # constrain = True,
+            # penalty = True,
+            # her = True
+        )
+
+        checkpoint_callback = ModifiedEvalCallback(
+            eval_env=eval_env,
             save_path=save_path,
             test_calculators=calculators[1:],
             verbose=1,

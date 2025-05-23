@@ -262,6 +262,9 @@ class EpistemicMCTS(BaseAlgorithm):
         return clone_env_state(temp), obs, r, done or trunc, info
 
     def plan(self, obs: Any) -> int:
+        if hasattr(self, "eval_env"):
+            self.eval_env = self.eval_env.envs[0] if hasattr(self.eval_env, 'envs') else self.eval_env
+            self.env = self.eval_env
         state = clone_env_state(self.env)
         if hasattr(self.env, "get_obs"):
             obs = self.env.get_obs()
@@ -364,7 +367,7 @@ class EpistemicMCTS(BaseAlgorithm):
         # user should implement updates to prior_net here
         pass
 
-    def predict(self, obs: Any, deterministic: bool=True) -> Tuple[np.ndarray, None]:
+    def predict(self, obs: Any, state=None, episode_start=None, deterministic=False,use_ensemble=False) -> Tuple[np.ndarray, None]:
         a = self.plan(obs)
         return np.array([a]), None
     
