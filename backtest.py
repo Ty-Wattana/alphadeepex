@@ -251,6 +251,17 @@ if __name__ == "__main__":
             continue
         run_backtest(ver, seed, exprs, weights)
 
+    for p in Path("out/e_miner").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "137477_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
+
     # oracle back test
 
     oracle_signal = data.compute_oracle_scores()
