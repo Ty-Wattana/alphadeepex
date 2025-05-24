@@ -16,6 +16,8 @@ from collections import deque
 
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+import torch
 
 # --- Helper: dynamic valid actions ---
 
@@ -52,6 +54,32 @@ def get_legal_actions(obs: Any, action_mask: Optional[List[bool]], action_space:
         return list(range(action_space.n))
     else:
         raise NotImplementedError("Only discrete action spaces are supported.")
+    
+def compute_mcts_losses(batch, prior_net, gamma):
+    """
+    batch: list of tuples (obs, value_target, var_target)
+    prior_net: your EpistemicRiskSeekerPolicy instance
+    gamma: discount factor (unused here, but you might incorporate multi-step)
+    """
+    # unpack batch
+    obs_list, value_targets, var_targets = zip(*batch)
+    # move to tensors
+    # prepare model inputs
+    arr = np.stack([o if not isinstance(o, dict) else o['obs'] for o in obs_list])
+    if arr.ndim == 2:
+        arr = arr[:, None, :]
+    x = torch.tensor(arr, dtype=torch.float32, device=prior_net.device)
+    # forward pass once
+    feat = prior_net.forward(x)        # (batch, hidden_dim)
+    v_pred = prior_net.value_head(feat).squeeze(-1)       # shape (batch,)
+    u_pred = prior_net.uncertainty_head(feat).squeeze(-1) # shape (batch,)
+    # build targets
+    v_target = torch.tensor(value_targets, dtype=torch.float32, device=prior_net.device)
+    u_target = torch.tensor(var_targets,   dtype=torch.float32, device=prior_net.device)
+    # losses
+    loss_v = F.mse_loss(v_pred, v_target)
+    loss_u = F.mse_loss(u_pred, u_target)
+    return loss_v + loss_u
 
 # --- EpistemicRiskSeekerPolicy ---
 class EpistemicRiskSeekerPolicy(nn.Module):
@@ -175,7 +203,7 @@ class EpistemicMCTSNode:
         legal = get_legal_actions(self.obs, self.mask, alg.action_space)
         return len(self.children) >= len(legal)
 
-    def expand(self, alg: 'EpistemicMCTS') -> 'EpistemicMCTSNode':
+    def expand(self, alg: 'EpistemicMCTS',env) -> 'EpistemicMCTSNode':
         # Refresh legal actions under current mask
         legal = get_legal_actions(self.obs, self.mask, alg.action_space)
         # Exclude children already expanded
@@ -185,9 +213,9 @@ class EpistemicMCTSNode:
         # Choose and remove one action
         action = random.choice(untried)
         # Simulate environment step
-        new_state, new_obs, reward, done, info = alg.simulate(self.state, action)
+        new_state, new_obs, reward, done, info = alg.simulate(self.state, action,env)
         # Clone env to extract next mask
-        temp_env = copy.deepcopy(alg.env)
+        temp_env = copy.deepcopy(env)
         restore_env_state(temp_env, new_state)
         child_mask = temp_env.action_masks() if hasattr(temp_env, 'action_masks') else None
         # Obtain prior probability from the prior network
@@ -255,8 +283,8 @@ class EpistemicMCTS(BaseAlgorithm):
     def _setup_model(self) -> None:
         # no standard policy/value networks to set up
         pass
-    def simulate(self, state: Any, action: int) -> Tuple[Any, Any, float, bool, dict]:
-        temp = copy.deepcopy(self.env)
+    def simulate(self, state: Any, action: int ,env) -> Tuple[Any, Any, float, bool, dict]:
+        temp = copy.deepcopy(env)
         restore_env_state(temp, state)
         obs, r, done, trunc, info = temp.step(action)
         return clone_env_state(temp), obs, r, done or trunc, info
@@ -264,14 +292,16 @@ class EpistemicMCTS(BaseAlgorithm):
     def plan(self, obs: Any) -> int:
         if hasattr(self, "eval_env"):
             self.eval_env = self.eval_env.envs[0] if hasattr(self.eval_env, 'envs') else self.eval_env
-            self.env = self.eval_env
-        state = clone_env_state(self.env)
-        if hasattr(self.env, "get_obs"):
-            obs = self.env.get_obs()
+            env = self.eval_env
         else:
-            obs = self.env.reset()[0]
+            env = self.env
+        state = clone_env_state(env)
+        if hasattr(env, "get_obs"):
+            obs = env.get_obs()
+        else:
+            obs = env.reset()[0]
         # Dynamically compute action mask from the current environment state.
-        mask = get_action_masks(self.env)
+        mask = get_action_masks(env)
         root = EpistemicMCTSNode(state, obs, mask=mask, prior=0.0)
         for _ in range(self.n_sims):
             node = root
@@ -282,7 +312,7 @@ class EpistemicMCTS(BaseAlgorithm):
                 node = node.best_child(self, self.c)
             # expansion
             if not node.done:
-                node = node.expand(self)
+                node = node.expand(self,env=env)
             # evaluation
             v = self.prior_net.get_value([node.obs])[0]
             u = self.prior_net.get_uncertainty([node.obs])[0]
@@ -360,12 +390,15 @@ class EpistemicMCTS(BaseAlgorithm):
         return self
 
     def _update_prior_net(self):
-        # placeholder for updating prior_net via collected replay samples
         if len(self.replay_buffer) < self.batch_size:
             return
+        # sample: replay_buffer stores (obs, v, u)
         batch = random.sample(self.replay_buffer, self.batch_size)
-        # user should implement updates to prior_net here
-        pass
+        loss = compute_mcts_losses(batch, self.prior_net, self.gamma)
+        # gradient step
+        self.prior_net.optimizer.zero_grad()
+        loss.backward()
+        self.prior_net.optimizer.step()
 
     def predict(self, obs: Any, state=None, episode_start=None, deterministic=False,use_ensemble=False) -> Tuple[np.ndarray, None]:
         a = self.plan(obs)

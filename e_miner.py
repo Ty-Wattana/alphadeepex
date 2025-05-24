@@ -317,21 +317,22 @@ class ModifiedEvalCallback(EvalCallback, BaseCallback):
         return True
 
     def _on_rollout_end(self) -> None:
+        # 1) train the prior_net
+        self.model._update_prior_net()
         # Custom logging and LLM logic
         if self.chat_session is not None:
             self._try_use_llm()
 
-        pool = self.pool
-        self.writer.add_scalar('pool/size', pool.size, self.num_timesteps)
-        self.writer.add_scalar('pool/significant', np.sum(np.abs(pool.weights[:pool.size]) > 1e-4), self.num_timesteps)
-        self.writer.add_scalar('pool/best_ic_ret', pool.best_ic_ret, self.num_timesteps)
-        self.writer.add_scalar('pool/eval_cnt', pool.eval_cnt, self.num_timesteps)
+        self.writer.add_scalar('pool/size', self.pool.size, self.num_timesteps)
+        self.writer.add_scalar('pool/significant', np.sum(np.abs(self.pool.weights[:self.pool.size]) > 1e-4), self.num_timesteps)
+        self.writer.add_scalar('pool/best_ic_ret', self.pool.best_ic_ret, self.num_timesteps)
+        self.writer.add_scalar('pool/eval_cnt', self.pool.eval_cnt, self.num_timesteps)
         self.writer.add_scalar('pool/expr_len', len(self.env_core._tokens), self.num_timesteps)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_mean, rank_ic_mean = 0.0, 0.0
         for i, calc in enumerate(self.test_calculators, start=1):
-            ic, rank_ic = pool.test_ensemble(calc)
+            ic, rank_ic = self.pool.test_ensemble(calc)
             weight = calc.data.n_days / n_days
             ic_mean += ic * weight
             rank_ic_mean += rank_ic * weight
@@ -544,7 +545,7 @@ def run_single_experiment(
             tb_log_name=name_prefix
         )
 
-        # checkpoint_callback.pool = latest_pool
+        checkpoint_callback.pool = latest_pool
         env = AlphaEnvDense(
             pool=latest_pool,
             device=device,
