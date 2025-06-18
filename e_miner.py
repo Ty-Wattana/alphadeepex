@@ -545,12 +545,12 @@ def run_single_experiment(
             tb_log_name=name_prefix
         )
 
-        checkpoint_callback.pool = latest_pool
+        # checkpoint_callback.pool = latest_pool
         env = AlphaEnvDense(
             pool=latest_pool,
             device=device,
             print_expr=True,
-            # penalty = True,
+            penalty = True,
             # constrain = True,
             # her = True
         )

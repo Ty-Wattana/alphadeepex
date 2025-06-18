@@ -204,8 +204,8 @@ if __name__ == "__main__":
     qlib_backtest = QlibBacktest(top_k=50, n_drop=5)
     data = StockData(
         instrument="csi300",
-        start_time="2022-01-01",
-        end_time="2023-06-30"
+        start_time="2022-07-01",
+        end_time="2024-01-01"
     )
     calc = QLibStockDataCalculator(data, None)
 
@@ -256,10 +256,13 @@ if __name__ == "__main__":
         size, seed = int(size), int(seed)
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
+
         try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "137477_steps_pool.json"))
-        except:
+            exprs, weights = load_alpha_pool_by_path(str(p / "496392_steps_pool.json"))
+            print(f"Loaded {len(exprs)} expressions from {p.name}")
+        except Exception as e:
             continue
+
         run_backtest(ver, seed, exprs, weights)
 
     # oracle back test
