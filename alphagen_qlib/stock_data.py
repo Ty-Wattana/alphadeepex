@@ -15,14 +15,16 @@ class FeatureType(IntEnum):
     VWAP = 5
 
 
-_DEFAULT_QLIB_DATA_PATH = "~/.qlib/qlib_data/cn_data"
+_DEFAULT_QLIB_DATA_PATH = "~/.qlib/qlib_data/us_data_update"
+# _DEFAULT_QLIB_DATA_PATH = "~/.qlib/qlib_data/cn_data"
 _QLIB_INITIALIZED = False
 
 
 def initialize_qlib(qlib_data_path: str = _DEFAULT_QLIB_DATA_PATH) -> None:
     import qlib
-    from qlib.config import REG_CN
-    qlib.init(provider_uri=qlib_data_path, region=REG_CN)
+    from qlib.config import REG_CN, REG_US
+    qlib.init(provider_uri=qlib_data_path, region=REG_US)
+    # qlib.init(provider_uri=qlib_data_path, region=REG_CN)
     global _QLIB_INITIALIZED
     _QLIB_INITIALIZED = True
 
@@ -174,10 +176,12 @@ class StockData:
         if len(columns) != n_columns:
             raise ValueError(f"size of columns ({len(columns)}) doesn't match with "
                              f"tensor feature count ({data.shape[2]})")
-        if self.max_future_days == 0:
-            date_index = self._dates[self.max_backtrack_days:]
-        else:
-            date_index = self._dates[self.max_backtrack_days:-self.max_future_days]
+        # if self.max_future_days == 0:
+        #     date_index = self._dates[self.max_backtrack_days:]
+        # else:
+        #     date_index = self._dates[self.max_backtrack_days:-self.max_future_days]
+        start = self.max_backtrack_days
+        date_index = self._dates[start:start + n_days]
         index = pd.MultiIndex.from_product([date_index, self._stock_ids])
         data = data.reshape(-1, n_columns)
         return pd.DataFrame(data.detach().cpu().numpy(), index=index, columns=columns)
@@ -189,7 +193,7 @@ class StockData:
         # The field '$close' is used here (adjust if your field naming is different)
         price_df:pd.DataFrame = D.features(
             instruments=instruments,
-            fields=["$close"],
+            fields=["$open","$close","$high","$low","$vwap"],
             start_time=self._start_time,
             end_time=self._end_time
         )

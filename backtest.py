@@ -13,6 +13,7 @@ from qlib.backtest import backtest, executor as exec
 from qlib.contrib.evaluate import risk_analysis
 from qlib.contrib.report.analysis_position import report_graph
 from qlib.contrib.strategy import TopkDropoutStrategy
+import qlib
 # from qlib.data import D
 
 from alphagen.data.expression import *
@@ -200,19 +201,24 @@ class QlibBacktest:
 
 
 if __name__ == "__main__":
-    initialize_qlib("~/.qlib/qlib_data/cn_data")
-    qlib_backtest = QlibBacktest(top_k=50, n_drop=5)
+    # initialize_qlib("~/.qlib/qlib_data/cn_data")
+    initialize_qlib("~/.qlib/qlib_data/us_data_update")
+    # qlib.init(provider_uri="~/.qlib/qlib_data/us_data_update", region="us")
+    qlib_backtest = QlibBacktest(benchmark = "^gspc",top_k=50, n_drop=5)
     data = StockData(
-        instrument="csi300",
-        start_time="2022-07-01",
+        # instrument="csi300",
+        instrument="sp500",
+        start_time="2022-01-29",
         end_time="2024-01-01"
     )
     calc = QLibStockDataCalculator(data, None)
 
+    out = "us"
+
     def run_backtest(prefix: str, seed: int, exprs: List[Expression], weights: List[float]):
         df = data.make_dataframe(calc.make_ensemble_alpha(exprs, weights))
         oracle_signal = data.compute_oracle_scores()
-        qlib_backtest.run(df,oracle_signal=oracle_signal, output_prefix=f"out/backtests/51-5/{prefix}/{seed}")
+        qlib_backtest.run(df,oracle_signal=oracle_signal, output_prefix=f"out/backtests/{out}/{prefix}/{seed}")
 
     for p in Path("out/gp").iterdir():
         seed = int(p.name)
@@ -268,7 +274,7 @@ if __name__ == "__main__":
     # oracle back test
 
     oracle_signal = data.compute_oracle_scores()
-    qlib_backtest.run(oracle_signal, output_prefix=f"out/backtests/51-5/oracle/0")
+    qlib_backtest.run(oracle_signal, output_prefix=f"out/backtests/{out}/oracle/0")
     exit(0)
     for p in Path("out/llm-tests/interaction").iterdir():
         if not p.name.startswith("v1"):
