@@ -236,6 +236,8 @@ class BootstrappedDQN(DQN):
                 masked_loss = loss_per_sample * masks[i]
                 # The final loss for this head is the mean over ONLY the active samples
                 loss = masked_loss.sum() / masks[i].sum()
+
+                self.logger.record(f"train/head_{i}_loss", loss.item())
                 
                 total_loss += loss
 
@@ -272,7 +274,7 @@ class BootstrappedDQN(DQN):
             observation,
             hidden=state,
             use_ensemble=use_ensemble,
-            use_ensemble=deterministic,
+            # use_ensemble=deterministic,
             mask_env=mask_env
         )
 
