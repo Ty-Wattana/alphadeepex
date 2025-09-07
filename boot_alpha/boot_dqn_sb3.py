@@ -25,6 +25,37 @@ def adjust_action_mask(mask: torch.Tensor, target_shape: tuple) -> torch.Tensor:
         adjusted_mask = mask
     return adjusted_mask
 
+def generate_deterministic_masks(
+    obs: torch.Tensor,
+    actions: torch.Tensor,
+    num_heads: int,
+    mask_prob: float
+) -> torch.Tensor:
+    """
+    Generates consistent masks on the fly based on observation and action content.
+    This version ensures each mask is independent of other samples in the batch.
+    """
+    batch_size = obs.shape[0]
+    masks = torch.zeros((num_heads, batch_size), device=obs.device)
+
+    flat_obs = obs.view(batch_size, -1)
+    hash_key = (flat_obs[:, 0] * 101 + flat_obs[:, -1] * 103 + actions.squeeze()).long()
+
+    # Generate a unique, deterministic mask for each head
+    for i in range(num_heads):
+        # Create a single generator for this head
+        g = torch.Generator(device=obs.device)
+        for j in range(batch_size):
+            # Seed the generator with this specific sample's hash + head index
+            sample_seed = hash_key[j].item() + i
+            g.manual_seed(sample_seed)
+            
+            # Generate a single random number and create the mask for this sample
+            rand_val = torch.rand(1, generator=g, device=obs.device)
+            if rand_val < mask_prob:
+                masks[i, j] = 1.0
+    return masks
+
 class LSTMQNet(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_actions, vocab_size=None, embedding_dim=None):
         """
@@ -119,101 +150,109 @@ class BootstrappedDQN(DQN):
         self.target_q_networks = nn.ModuleList([
             copy.deepcopy(net) for net in self.q_networks
         ])
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        self.optimizer = torch.optim.Adam(self._collect_q_parameters(), lr=1e-3)
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
-    def parameters(self):
+    def _collect_q_parameters(self):
         params = []
         for net in self.q_networks:
-            params += list(net.parameters())
+            params.extend(list(net.parameters()))
         return params
 
     def sample_episode_head(self):
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
     def _sample_bootstrapped_masks(self, batch_size: int) -> torch.Tensor:
-        masks = torch.rand((self.num_bootstrapped_nets, batch_size)) < self.mask_prob
-        return masks.float().to(self.device)
+        return torch.ones((self.num_bootstrapped_nets, batch_size), device=self.device)
 
     def store_transition(self, transition):
         self.replay_buffer.append(transition)
 
-    def train(self, gradient_steps=1, batch_size: int = 100):
-        self.sample_episode_head()
+    def train(self, gradient_steps: int = 1, batch_size: int = 100):
+        """
+        Trains the bootstrapped Q-networks.
+
+        REMINDER: The call to `self.sample_episode_head()` should be moved to a
+        callback that runs at the beginning of each new episode to ensure
+        temporally-extended exploration. It is not called here.
+        """
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
-        batch = self.replay_buffer.sample(batch_size)
 
-        # If observations come as a dict (from HERReplayBuffer), extract the "observation" field.
-        if isinstance(batch.observations, dict):
-            obs = batch.observations["observation"].to(self.device)
-            next_obs = batch.next_observations["observation"].to(self.device)
-        else:
-            obs = batch.observations.to(self.device)
-            next_obs = batch.next_observations.to(self.device)
+        for step in range(gradient_steps):
+            # 1. Sample a batch from the replay buffer
+            batch = self.replay_buffer.sample(batch_size)
 
-        actions = batch.actions.long().to(self.device)
-        rewards = batch.rewards.float().to(self.device)
-        dones = batch.dones.float().to(self.device)
+            if isinstance(batch.observations, dict):
+                obs = batch.observations["observation"].to(self.device)
+                next_obs = batch.next_observations["observation"].to(self.device)
+            else:
+                obs = batch.observations.to(self.device)
+                next_obs = batch.next_observations.to(self.device)
 
-        reward_mean = torch.mean(rewards)
-        self.logger.record("train/mean_reward", reward_mean.item())
+            actions = batch.actions.long().to(self.device)
+            rewards = batch.rewards.float().to(self.device)
+            dones = batch.dones.float().to(self.device)
+            
+            # 2. Generate deterministic masks on the fly
+            # This is the workaround for not storing masks in the replay buffer.
+            # To use the simpler ensemble method, you would instead use:
+            # masks = torch.ones((self.num_bootstrapped_nets, batch_size), device=self.device)
+            masks = generate_deterministic_masks(obs, actions, self.num_bootstrapped_nets, self.mask_prob)
 
-        hidden = None  # Reset hidden state for training
-        masks = self._sample_bootstrapped_masks(batch_size)
-        losses = []
-        for i in range(self.num_bootstrapped_nets):
-            with torch.no_grad():
-                next_q, _ = self.target_q_networks[i](next_obs, hidden)
-                next_max_q, _ = torch.max(next_q, dim=1)
-                rewards_squeezed = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
-                dones_squeezed = dones.squeeze(-1) if dones.dim() > 1 else dones
-                target_q = rewards_squeezed + self.gamma * (1 - dones_squeezed) * next_max_q
+            total_loss = 0.0
+            active_heads = 0
+            hidden = None  # Reset LSTM hidden state for the batch
 
-            current_q, _ = self.q_networks[i](obs, hidden)
-            if current_q.dim() > 2:
-                current_q = current_q.view(current_q.size(0), -1)
-            action_indices = actions.unsqueeze(1) if actions.dim() == 1 else actions
-            current_q = current_q.gather(1, action_indices).squeeze(1)
-            loss = F.mse_loss(current_q, target_q, reduction='none')
-            loss = loss * masks[i].mean()
-            losses.append(torch.mean(loss).item())
-            loss = loss.mean()
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            # 3. Calculate loss for each head
+            for i in range(self.num_bootstrapped_nets):
+                # Skip update if no data in the batch is assigned to this head
+                if masks[i].sum() == 0:
+                    continue
+                
+                active_heads += 1
 
-        self.logger.record("train/loss", np.mean(losses))
+                # Calculate target Q-values using the head's specific target network
+                with torch.no_grad():
+                    next_q_online, _ = self.q_networks[i](next_obs, hidden)
+                    next_actions = next_q_online.argmax(dim=1, keepdim=True)  # shape (B,1)
+                    next_q_target, _ = self.target_q_networks[i](next_obs, hidden)
+                    next_q_target_sel = next_q_target.gather(1, next_actions).squeeze(1)
+
+                    rewards_squeezed = rewards.squeeze(-1) if rewards.dim() > 1 else rewards
+                    dones_squeezed = dones.squeeze(-1) if dones.dim() > 1 else dones
+
+                    target_q = rewards_squeezed + self.gamma * (1 - dones_squeezed) * next_q_target_sel
+
+                # Get current Q-values for the actions taken
+                current_q, _ = self.q_networks[i](obs, hidden)
+                action_indices = actions.unsqueeze(1) if actions.dim() == 1 else actions
+                current_q_sa = current_q.gather(1, action_indices).squeeze(1)
+
+                # --- CRITICAL FIX: Correct Loss Calculation ---
+                # Calculate MSE loss for each sample in the batch
+                loss_per_sample = F.mse_loss(current_q_sa, target_q, reduction='none')
+                # Apply the binary mask element-wise to zero out losses for unselected samples
+                masked_loss = loss_per_sample * masks[i]
+                # The final loss for this head is the mean over ONLY the active samples
+                loss = masked_loss.sum() / masks[i].sum()
+                
+                total_loss += loss
+
+            # 4. Perform a single optimizer step using the average loss across active heads
+            if active_heads > 0:
+                avg_loss = total_loss / active_heads
+                self.logger.record("train/loss", avg_loss.item())
+
+                self.optimizer.zero_grad()
+                avg_loss.backward()
+                self.optimizer.step()
+
+        # 5. Update all target networks using Polyak averaging
         for i in range(self.num_bootstrapped_nets):
             polyak_update(self.q_networks[i].parameters(),
-                          self.target_q_networks[i].parameters(),
-                          self.tau)
-
-    # def predict(self, observation, hidden=None, use_ensemble=False):
-    #     # If observation is dict (as in HER), extract the "observation" component.
-    #     if isinstance(observation, dict):
-    #         obs_tensor = torch.tensor(observation["observation"], dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
-    #     elif isinstance(observation, (list, np.ndarray)):
-    #         obs_tensor = torch.tensor(observation, dtype=torch.long if self.q_networks[0].embedding is not None else torch.float32, device=self.device)
-    #         if obs_tensor.dim() == 1:
-    #             obs_tensor = obs_tensor.unsqueeze(0)
-    #     else:
-    #         obs_tensor = observation.to(self.device)
-
-    #     with torch.no_grad():
-    #         if use_ensemble:
-    #             qs = []
-    #             for net in self.q_networks:
-    #                 q, hidden_out = net(obs_tensor, hidden)
-    #                 qs.append(q)
-    #             q_values = torch.stack(qs, dim=0).mean(dim=0)
-    #         else:
-    #             q_values, hidden_out = self.q_networks[self.current_head](obs_tensor, hidden)
-    #     raw_mask = torch.as_tensor(get_action_masks(self.env)).to(self.device)
-    #     mask = adjust_action_mask(raw_mask, q_values.shape)
-    #     q_values = torch.where(mask, q_values, torch.tensor(-float('inf')).to(self.device))
-    #     action = torch.argmax(q_values, dim=1).cpu().numpy()
-    #     return action, hidden_out
+                        self.target_q_networks[i].parameters(),
+                        self.tau)
 
     def predict(self, observation, state=None, episode_start=None, deterministic=False,use_ensemble=False):
         """
@@ -232,27 +271,10 @@ class BootstrappedDQN(DQN):
         return self._predict_internal(
             observation,
             hidden=state,
+            use_ensemble=use_ensemble,
             use_ensemble=deterministic,
             mask_env=mask_env
         )
-        # """
-        # SB3-compatible predict signature:
-        #   - observation: current observation
-        #   - state: hidden state
-        #   - episode_start: mask or flag indicating new episode(s)
-        #   - deterministic: whether to use ensemble or single head
-        # Returns:
-        #   actions (np.ndarray), new_hidden_state
-        # """
-        # # Reset hidden state at episode start if provided
-        # if episode_start is not None:
-        #     # If episode_start is a boolean array, reset state where True
-        #     # Here we simply drop old state to reinitialize in internal method
-        #     state = None
-        # # Delegate to internal prediction logic
-        # return self._predict_internal(
-        #     observation, hidden=state, use_ensemble=deterministic
-        # )
 
     def _predict_internal(self, observation, hidden=None, use_ensemble=False, mask_env=None):
         # Extract raw observation
@@ -275,9 +297,11 @@ class BootstrappedDQN(DQN):
                 q_values, hidden_out = self.q_networks[self.current_head](obs_tensor, hidden)
 
         # Apply action mask
-        raw_mask = torch.as_tensor(get_action_masks(mask_env)).to(self.device)
+        raw_mask = torch.as_tensor(get_action_masks(mask_env), device=self.device)
+        raw_mask = (raw_mask != 0)
         mask = adjust_action_mask(raw_mask, q_values.shape)
-        q_values = torch.where(mask, q_values, torch.tensor(-float('inf'), device=self.device))
+        mask = mask.bool()
+        q_values = torch.where(mask, q_values, torch.tensor(-1e9, device=self.device))
         action = torch.argmax(q_values, dim=1).cpu().numpy()
 
         return action, hidden_out
