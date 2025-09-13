@@ -204,7 +204,7 @@ if __name__ == "__main__":
     qlib_backtest = QlibBacktest(top_k=50, n_drop=5)
     data = StockData(
         instrument="csi300",
-        start_time="2022-07-01",
+        start_time="2022-01-17",
         end_time="2024-01-01"
     )
     calc = QLibStockDataCalculator(data, None)
@@ -235,7 +235,7 @@ if __name__ == "__main__":
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "57700_steps_pool.json"))
+            exprs, weights = load_alpha_pool_by_path(str(p / "247300_steps_pool.json"))
         except:
             continue
         run_backtest(ver, seed, exprs, weights)
