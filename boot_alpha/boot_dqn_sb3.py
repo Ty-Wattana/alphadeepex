@@ -214,6 +214,12 @@ class BootstrappedDQN(DQN):
 
                 # Calculate target Q-values using the head's specific target network
                 with torch.no_grad():
+                    # Knowledge Distillation: add a secondary loss term where each head is encouraged to not only match 
+                    # its TD target but also to mimic the Q-value distribution of the ensemble average. 
+                    # This would encourage heads to agree in well-understood states while allowing them to differ in others.
+                    all_q_values = torch.stack([net(obs)[0] for net in self.q_networks])
+                    mean_q_values = all_q_values.mean(dim=0)
+
                     next_q_online, _ = self.q_networks[i](next_obs, hidden)
                     next_actions = next_q_online.argmax(dim=1, keepdim=True)  # shape (B,1)
                     next_q_target, _ = self.target_q_networks[i](next_obs, hidden)
@@ -229,7 +235,6 @@ class BootstrappedDQN(DQN):
                 action_indices = actions.unsqueeze(1) if actions.dim() == 1 else actions
                 current_q_sa = current_q.gather(1, action_indices).squeeze(1)
 
-                # --- CRITICAL FIX: Correct Loss Calculation ---
                 # Calculate MSE loss for each sample in the batch
                 loss_per_sample = F.mse_loss(current_q_sa, target_q, reduction='none')
                 # Apply the binary mask element-wise to zero out losses for unselected samples
@@ -237,9 +242,13 @@ class BootstrappedDQN(DQN):
                 # The final loss for this head is the mean over ONLY the active samples
                 loss = masked_loss.sum() / masks[i].sum()
 
-                self.logger.record(f"train/head_{i}_loss", loss.item())
+                # Knowledge Distillation loss term
+                distillation_loss = F.mse_loss(current_q, mean_q_values)
+                total_head_loss = loss + 0.1 * distillation_loss # 0.1 is a hyperparameter
+
+                self.logger.record(f"train/head_{i}_loss", total_head_loss.item())
                 
-                total_loss += loss
+                total_loss += total_head_loss # Accumulate total loss across heads
 
             # 4. Perform a single optimizer step using the average loss across active heads
             if active_heads > 0:
