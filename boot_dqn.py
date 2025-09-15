@@ -224,6 +224,12 @@ class ModifiedEvalCallback(EventCallback):
     def _on_step(self) -> bool:
         # Only run evaluation every eval_freq calls
         if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            # --- Parameter averaging for all heads ---
+            if hasattr(self.model, "average_head_parameters"):
+                self.model.average_head_parameters(alpha=0.01)
+                if self.verbose > 0:
+                    print(f"Step {self.n_calls}: Performed parameter averaging for all heads.")
+            
             # Sync normalization if needed
             if self.model.get_vec_normalize_env() is not None:
                 try:

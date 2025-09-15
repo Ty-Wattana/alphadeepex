@@ -168,6 +168,41 @@ class BootstrappedDQN(DQN):
     def store_transition(self, transition):
         self.replay_buffer.append(transition)
 
+    def average_head_parameters(self, alpha: float = 0.01):
+        """
+        Nudges the parameters of each head towards the average of all heads.
+        
+        :param alpha: The strength of the pull towards the average. 
+                      0.0 means no change, 1.0 would set all heads to the average.
+        """
+        # Ensure alpha is within a valid range
+        if not (0.0 < alpha <= 1.0):
+            return
+
+        # Step 1: Get the state dictionary of the first head to know the parameter names
+        first_head_state_dict = self.q_networks[0].state_dict()
+        avg_state_dict = {}
+
+        with torch.no_grad():
+            # Step 2: Calculate the average for each parameter across all heads
+            for key in first_head_state_dict.keys():
+                # Stack the same parameter from all heads into a new tensor
+                param_stack = torch.stack([net.state_dict()[key] for net in self.q_networks])
+                # Calculate the mean along the first dimension (the one we stacked on)
+                avg_state_dict[key] = torch.mean(param_stack, dim=0)
+
+            # Step 3: Nudge each head's parameters towards the calculated average
+            for head_net in self.q_networks:
+                for key in first_head_state_dict.keys():
+                    # Get the current parameter tensor for this head
+                    current_param = head_net.state_dict()[key]
+                    
+                    # Update the parameter using the formula: (1 - alpha) * current + alpha * average
+                    updated_param = (1 - alpha) * current_param + alpha * avg_state_dict[key]
+                    
+                    # Overwrite the head's parameter with the new, nudged value
+                    current_param.copy_(updated_param)
+
     def train(self, gradient_steps: int = 1, batch_size: int = 100):
         """
         Trains the bootstrapped Q-networks.
