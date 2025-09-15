@@ -241,7 +241,7 @@ if __name__ == "__main__":
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "247300_steps_pool.json"))
+            exprs, weights = load_alpha_pool_by_path(str(p / "17600_steps_pool.json"))
         except:
             continue
         run_backtest(ver, seed, exprs, weights)
