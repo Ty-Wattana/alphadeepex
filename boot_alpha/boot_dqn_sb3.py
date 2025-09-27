@@ -132,6 +132,7 @@ class BootstrappedDQN(DQN):
         self.num_bootstrapped_nets = num_bootstrapped_nets
         self.mask_prob = mask_prob
         self.device = device
+        self.head_weights = torch.ones(self.num_bootstrapped_nets, device=self.device) / self.num_bootstrapped_nets
 
         # Get environment dimensions.
         # If using token sequences, input_dim should be the sequence length
@@ -181,15 +182,16 @@ class BootstrappedDQN(DQN):
 
         # Step 1: Get the state dictionary of the first head to know the parameter names
         first_head_state_dict = self.q_networks[0].state_dict()
-        avg_state_dict = {}
+        weighted_avg_state_dict = {}
 
         with torch.no_grad():
             # Step 2: Calculate the average for each parameter across all heads
             for key in first_head_state_dict.keys():
-                # Stack the same parameter from all heads into a new tensor
                 param_stack = torch.stack([net.state_dict()[key] for net in self.q_networks])
+                # Stack the same parameter from all heads into a new tensor
+                weights = self.head_weights.view(-1, *([1] * (param_stack.dim() - 1)))
                 # Calculate the mean along the first dimension (the one we stacked on)
-                avg_state_dict[key] = torch.mean(param_stack, dim=0)
+                weighted_avg_state_dict[key] = torch.sum(param_stack * weights, dim=0)
 
             # Step 3: Nudge each head's parameters towards the calculated average
             for head_net in self.q_networks:
@@ -198,7 +200,7 @@ class BootstrappedDQN(DQN):
                     current_param = head_net.state_dict()[key]
                     
                     # Update the parameter using the formula: (1 - alpha) * current + alpha * average
-                    updated_param = (1 - alpha) * current_param + alpha * avg_state_dict[key]
+                    updated_param = (1 - alpha) * current_param + alpha * weighted_avg_state_dict[key]
                     
                     # Overwrite the head's parameter with the new, nudged value
                     current_param.copy_(updated_param)
@@ -240,6 +242,9 @@ class BootstrappedDQN(DQN):
             hidden = None  # Reset LSTM hidden state for the batch
 
             # 3. Calculate loss for each head
+
+            head_losses = torch.zeros(self.num_bootstrapped_nets, device=self.device)
+
             for i in range(self.num_bootstrapped_nets):
                 # Skip update if no data in the batch is assigned to this head
                 if masks[i].sum() == 0:
@@ -249,6 +254,9 @@ class BootstrappedDQN(DQN):
 
                 # Calculate target Q-values using the head's specific target network
                 with torch.no_grad():
+                    inverse_losses = 1.0 / (head_losses + 1e-8)
+                    self.head_weights = torch.nn.functional.softmax(inverse_losses, dim=0)
+
                     next_q_online, _ = self.q_networks[i](next_obs, hidden)
                     next_actions = next_q_online.argmax(dim=1, keepdim=True)  # shape (B,1)
                     next_q_target, _ = self.target_q_networks[i](next_obs, hidden)
@@ -271,6 +279,7 @@ class BootstrappedDQN(DQN):
                 masked_loss = loss_per_sample * masks[i]
                 # The final loss for this head is the mean over ONLY the active samples
                 loss = masked_loss.sum() / masks[i].sum()
+                head_losses[i] = loss.detach() # Use .detach() to prevent gradient issues
 
                 self.logger.record(f"train/head_{i}_loss", loss.item())
                 
