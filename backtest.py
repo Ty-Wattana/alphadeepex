@@ -214,20 +214,20 @@ if __name__ == "__main__":
         oracle_signal = data.compute_oracle_scores()
         qlib_backtest.run(df,oracle_signal=oracle_signal, output_prefix=f"out/backtests/51-5/{prefix}/{seed}")
 
-    for p in Path("out/gp").iterdir():
-        seed = int(p.name)
-        with open(p / "40.json") as f:
-            report = json.load(f)
-        state = report["res"]["res"]["pool_state"]
-        run_backtest("gp", seed, [parse_expression(e) for e in state["exprs"]], state["weights"])
-    # exit(0)
-    for p in Path("out/results").iterdir():
-        inst, size, seed, time, ver = p.name.split('_', 4)
-        size, seed = int(size), int(seed)
-        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
-            continue
-        exprs, weights = load_alpha_pool_by_path(str(p / "251904_steps_pool.json"))
-        run_backtest(ver, seed, exprs, weights)
+    # for p in Path("out/gp").iterdir():
+    #     seed = int(p.name)
+    #     with open(p / "40.json") as f:
+    #         report = json.load(f)
+    #     state = report["res"]["res"]["pool_state"]
+    #     run_backtest("gp", seed, [parse_expression(e) for e in state["exprs"]], state["weights"])
+    # # exit(0)
+    # for p in Path("out/results").iterdir():
+    #     inst, size, seed, time, ver = p.name.split('_', 4)
+    #     size, seed = int(size), int(seed)
+    #     if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+    #         continue
+    #     exprs, weights = load_alpha_pool_by_path(str(p / "251904_steps_pool.json"))
+    #     run_backtest(ver, seed, exprs, weights)
 
     for p in Path("out/boot_dqn").iterdir():
         inst, size, seed, time, ver = p.name.split('_', 4)
@@ -235,46 +235,46 @@ if __name__ == "__main__":
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "247300_steps_pool.json"))
+            exprs, weights = load_alpha_pool_by_path(str(p / "83500_steps_pool.json"))
         except:
             continue
         run_backtest(ver, seed, exprs, weights)
 
-    for p in Path("out/risk_miner").iterdir():
-        inst, size, seed, time, ver = p.name.split('_', 4)
-        size, seed = int(size), int(seed)
-        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
-            continue
-        try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "12477_steps_pool.json"))
-        except:
-            continue
-        run_backtest(ver, seed, exprs, weights)
+    # for p in Path("out/risk_miner").iterdir():
+    #     inst, size, seed, time, ver = p.name.split('_', 4)
+    #     size, seed = int(size), int(seed)
+    #     if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+    #         continue
+    #     try:
+    #         exprs, weights = load_alpha_pool_by_path(str(p / "12477_steps_pool.json"))
+    #     except:
+    #         continue
+    #     run_backtest(ver, seed, exprs, weights)
 
-    for p in Path("out/e_miner").iterdir():
-        inst, size, seed, time, ver = p.name.split('_', 4)
-        size, seed = int(size), int(seed)
-        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
-            continue
+    # for p in Path("out/e_miner").iterdir():
+    #     inst, size, seed, time, ver = p.name.split('_', 4)
+    #     size, seed = int(size), int(seed)
+    #     if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+    #         continue
 
-        try:
-            exprs, weights = load_alpha_pool_by_path(str(p / "496392_steps_pool.json"))
-            print(f"Loaded {len(exprs)} expressions from {p.name}")
-        except Exception as e:
-            continue
+    #     try:
+    #         exprs, weights = load_alpha_pool_by_path(str(p / "496392_steps_pool.json"))
+    #         print(f"Loaded {len(exprs)} expressions from {p.name}")
+    #     except Exception as e:
+    #         continue
 
-        run_backtest(ver, seed, exprs, weights)
+    #     run_backtest(ver, seed, exprs, weights)
 
     # oracle back test
 
-    oracle_signal = data.compute_oracle_scores()
-    qlib_backtest.run(oracle_signal, output_prefix=f"out/backtests/51-5/oracle/0")
-    exit(0)
-    for p in Path("out/llm-tests/interaction").iterdir():
-        if not p.name.startswith("v1"):
-            continue
-        run = int(p.name[3])
-        with open(p / "report.json") as f:
-            report = json.load(f)
-        state = report[-1]["pool_state"]
-        run_backtest("pure_llm", run, [parse_expression(t[0]) for t in state], [t[1] for t in state])
+    # oracle_signal = data.compute_oracle_scores()
+    # qlib_backtest.run(oracle_signal, output_prefix=f"out/backtests/51-5/oracle/0")
+    # exit(0)
+    # for p in Path("out/llm-tests/interaction").iterdir():
+    #     if not p.name.startswith("v1"):
+    #         continue
+    #     run = int(p.name[3])
+    #     with open(p / "report.json") as f:
+    #         report = json.load(f)
+    #     state = report[-1]["pool_state"]
+    #     run_backtest("pure_llm", run, [parse_expression(t[0]) for t in state], [t[1] for t in state])

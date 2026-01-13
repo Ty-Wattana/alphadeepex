@@ -301,6 +301,40 @@ class ModifiedEvalCallback(EventCallback):
     def env_core(self):
         # Access to underlying env_core for pool
         return self.training_env.envs[0].unwrapped  # type: ignore
+    
+class EpisodePerformanceCallback(BaseCallback):
+    """
+    A callback to:
+    1. Log the performance of the active head at the end of an episode.
+    2. Tell the model to sample a new head for the next episode.
+    
+    NOTE: This callback is simplified and assumes n_envs=1.
+    """
+    def __init__(self, verbose=0):
+        super(EpisodePerformanceCallback, self).__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Check if any environments just finished an episode
+        if np.any(self.locals["dones"]):
+            
+            # This logic assumes n_envs=1. For VecEnvs, you'd need to loop
+            # over self.locals["dones"] and manage an array of active heads.
+            if self.locals["dones"][0]:
+                # Get the reward from the "info" dictionary
+                reward = self.locals["infos"][0]["episode"]["r"]
+                
+                # Get the head that was active for this *just finished* episode
+                active_head = self.model.current_head
+                
+                # Log this performance to the model
+                if hasattr(self.model, "log_head_performance"):
+                    self.model.log_head_performance(active_head, reward)
+                
+                # Sample a *new* head for the *next* episode
+                if hasattr(self.model, "sample_episode_head"):
+                    self.model.sample_episode_head()
+
+        return True
 
 
 
@@ -424,10 +458,15 @@ def run_single_experiment(
         test_calculators=calculators[1:],
         eval_env=eval_env,
     )
+
+    performance_callback = EpisodePerformanceCallback()
+
     model = BootstrappedDQN(
         policy="MlpPolicy",
         # policy="MultiInputPolicy",
         env=env,
+        prob_cap=0.3, 
+        perf_window=10,
         train_freq=(1, "episode"),
         num_bootstrapped_nets=20,
         mask_prob=0.8,
@@ -458,7 +497,7 @@ def run_single_experiment(
     )
     model.learn(
         total_timesteps=steps,
-        callback=checkpoint_callback,
+        callback=[performance_callback,checkpoint_callback],
         tb_log_name=name_prefix,
     )
 

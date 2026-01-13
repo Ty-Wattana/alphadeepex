@@ -7,6 +7,7 @@ from stable_baselines3 import DQN
 from stable_baselines3 import HerReplayBuffer
 from gymnasium import spaces
 from sb3_contrib.common.maskable.utils import get_action_masks
+from collections import deque
 
 # Polyak update helper function
 def polyak_update(source_params, target_params, tau):
@@ -125,6 +126,8 @@ class BootstrappedDQN(DQN):
         # Optionally pass embedding parameters if using token sequences.
         vocab_size: int = None,
         embedding_dim: int = None,
+        prob_cap: float = 0.3, # Max probability for one head before reset
+        perf_window: int = 10, # Rolling average window for head performance
         **kwargs,
     ):
         # IMPORTANT: Pass HERReplayBuffer as the replay_buffer_class
@@ -132,6 +135,17 @@ class BootstrappedDQN(DQN):
         self.num_bootstrapped_nets = num_bootstrapped_nets
         self.mask_prob = mask_prob
         self.device = device
+
+        # --- NEW ATTRIBUTES ---
+        self.prob_cap = prob_cap
+        # Stores the current sampling probabilities for each head
+        self.head_probabilities = np.full(
+            self.num_bootstrapped_nets, 1.0 / self.num_bootstrapped_nets
+        )
+        # Stores the last `perf_window` episode rewards for each head
+        self.head_performance = [
+            deque(maxlen=perf_window) for _ in range(self.num_bootstrapped_nets)
+        ]
 
         # Get environment dimensions.
         # If using token sequences, input_dim should be the sequence length
@@ -153,6 +167,9 @@ class BootstrappedDQN(DQN):
         self.optimizer = torch.optim.Adam(self._collect_q_parameters(), lr=1e-3)
         self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
 
+        # Make sure to call the *new* sample_episode_head to set the initial head
+        self.sample_episode_head()
+
     def _collect_q_parameters(self):
         params = []
         for net in self.q_networks:
@@ -160,8 +177,73 @@ class BootstrappedDQN(DQN):
         return params
 
     def sample_episode_head(self):
-        self.current_head = np.random.randint(0, self.num_bootstrapped_nets)
+        """
+        Samples a new head to act for the next episode based on the
+        current head_probabilities distribution.
+        """
+        self.current_head = np.random.choice(
+            self.num_bootstrapped_nets, p=self.head_probabilities
+        )
+        # Add a check to see if the logger has been initialized by .learn()
+        if hasattr(self, "_logger") and self.logger is not None:
+            self.logger.record("train/active_head", self.current_head)
 
+    def log_head_performance(self, head_index: int, episode_reward: float):
+        """
+        Called by a callback to log the reward for the head that just
+        finished an episode.
+        """
+        if head_index < 0 or head_index >= self.num_bootstrapped_nets:
+            return # Safety check
+            
+        self.head_performance[head_index].append(episode_reward)
+        self.logger.record(f"performance/head_{head_index}_reward", episode_reward)
+        # After logging, recalculate the probabilities for the *next* sampling
+        self._recalculate_probabilities()
+
+    def _recalculate_probabilities(self):
+        """
+        Updates the head_probabilities based on performance.
+        Includes a WARM-UP check to prevent immediate resets.
+        """
+        # WARM-UP: Ensure all heads have some data
+        if any(len(q) == 0 for q in self.head_performance):
+            return
+
+        # Get the rolling mean reward for each head
+        mean_rewards = np.array([np.mean(q) for q in self.head_performance])
+        
+        # Normalize rewards to have zero mean and unit variance
+        reward_std = np.std(mean_rewards)
+        if reward_std > 1e-6:
+            mean_rewards = mean_rewards / reward_std
+
+        # Standard Stable Softmax
+        shift = mean_rewards.max()
+        # Divide by a temperature (optional, e.g., 1.0) to soften distribution if needed
+        exp_rewards = np.exp(mean_rewards - shift) 
+        probabilities = exp_rewards / np.sum(exp_rewards)
+
+        # --- The Circuit-Breaker ---
+        if np.any(probabilities > self.prob_cap):
+            # Reset to uniform
+            self.head_probabilities = np.full(
+                self.num_bootstrapped_nets, 1.0 / self.num_bootstrapped_nets
+            )
+            # Clear history to restart the race
+            for q in self.head_performance:
+                q.clear()
+            
+            # Use a different log key so you can see it happening distinct from other logs
+            self.logger.record("train/prob_reset_triggered", 1) 
+        else:
+            self.head_probabilities = probabilities
+            self.logger.record("train/prob_reset_triggered", 0)
+
+        # Log new probabilities
+        for i, prob in enumerate(self.head_probabilities):
+            self.logger.record(f"probabilities/head_{i}_prob", prob)
+    
     def _sample_bootstrapped_masks(self, batch_size: int) -> torch.Tensor:
         return torch.ones((self.num_bootstrapped_nets, batch_size), device=self.device)
 
