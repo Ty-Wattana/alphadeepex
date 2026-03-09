@@ -241,6 +241,51 @@ if __name__ == "__main__":
         if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
             continue
         try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "247300_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
+
+
+    for p in Path("out/boot_dqn").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "17600_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
+
+    for p in Path("out/boot_dqn").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "23100_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
+
+    for p in Path("out/boot_dqn").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
+            exprs, weights = load_alpha_pool_by_path(str(p / "66600_steps_pool.json"))
+        except:
+            continue
+        run_backtest(ver, seed, exprs, weights)
+
+    for p in Path("out/boot_dqn").iterdir():
+        inst, size, seed, time, ver = p.name.split('_', 4)
+        size, seed = int(size), int(seed)
+        if inst != "csi300" or size != 20 or time < "20240923" or ver == "llm_d5":
+            continue
+        try:
             exprs, weights = load_alpha_pool_by_path(str(p / "83500_steps_pool.json"))
         except:
             continue
